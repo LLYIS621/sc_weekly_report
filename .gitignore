@@ -25,3 +25,7 @@ tmp/
 
 # 大文件（按需）
 data/
+
+# 忽略EXCEL文档
+*.xlsx
+*.xls

@@ -24,6 +24,7 @@ const LABOR_COST_MODULES = ['图片', '混剪'];
 const LABOR_COST_UNIT = {'图片': '元/张', '混剪': '元/条'};
 const LABOR_COST_METRIC = {key: 'single_labor_cost', label: '单素材人力成本', unit: '元'};
 const SCRIPT_MODULE = '内容团队-编剧';
+const NARROW_OUTPUT_BAR_MODULES = ['内容团队-编剧', '内容团队-导演', '内容团队-摄像', '内容团队-剪辑'];
 const SCRIPT_OUTPUT_MODES = {
   write: {label: '写脚本数', prefix: ''},
   handoff: {label: '对接脚本数', prefix: 'handoff_'}
@@ -433,6 +434,7 @@ function renderModule(moduleName, view, moduleIdx) {
       const ctx = canvas.getContext('2d');
 
       if(m.key === 'total_output') {
+        const useNarrowOutputBars = NARROW_OUTPUT_BAR_MODULES.indexOf(moduleName) !== -1;
         const vals = labels.map(l => { const v = item.metrics[l]; return v && v[metricKey] !== undefined ? v[metricKey] : 0; });
         charts[canvasId] = new Chart(ctx, {
           type: 'bar',
@@ -443,7 +445,8 @@ function renderModule(moduleName, view, moduleIdx) {
               backgroundColor: hexToRgba(item.color, item.isTotal ? 0.9 : 0.8),
               hoverBackgroundColor: hexToRgba(item.color, 0.85),
               borderRadius: 4, borderSkipped: 'bottom',
-              barPercentage: 0.9, categoryPercentage: 0.95,
+              barPercentage: useNarrowOutputBars ? 0.75 : 0.9,
+              categoryPercentage: useNarrowOutputBars ? 0.85 : 0.95,
               shadowColor: 'rgba(0,0,0,0.18)',
               shadowBlur: 8,
               shadowOffsetX: 0,
