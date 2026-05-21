@@ -166,10 +166,22 @@ def main():
             year += 2000
         return (year, week)
 
+    def get_week_end_date(w):
+        year, week = sort_week_key(w)
+        if year == 0 or week == 0:
+            return None
+        try:
+            return date.fromisocalendar(year, week, 7)
+        except ValueError:
+            return None
+
     all_week_periods = sorted(list(all_week_keys), key=sort_week_key)
 
     RECENT_MONTHS = all_months[-4:] if len(all_months) >= 4 else all_months
     RECENT_WEEKS = all_week_periods[-4:] if len(all_week_periods) >= 4 else all_week_periods
+    latest_week_end_date = get_week_end_date(RECENT_WEEKS[-1]) if RECENT_WEEKS else None
+    if latest_week_end_date:
+        print(f'  月度工作日截止日: {latest_week_end_date}')
     print(f'  近四月: {RECENT_MONTHS}')
     print(f'  近四周: {RECENT_WEEKS}')
 
@@ -381,7 +393,9 @@ def main():
     month_workdays = {}
     for month_key in RECENT_MONTHS:
         first, last = get_month_range(month_key)
-        month_workdays[month_key] = count_workdays(first, last)
+        if latest_week_end_date:
+            last = min(last, latest_week_end_date)
+        month_workdays[month_key] = count_workdays(first, last) if first <= last else 0
 
     # 计算每周工作日
     week_workdays = {}

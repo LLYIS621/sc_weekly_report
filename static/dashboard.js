@@ -1374,6 +1374,10 @@ function formatUtcMMDDV3(date) {
   return pad2V3(date.getUTCMonth() + 1) + pad2V3(date.getUTCDate());
 }
 
+function formatUtcMMDDRangeV3(start, end, separator) {
+  return formatUtcMMDDV3(start) + separator + formatUtcMMDDV3(end);
+}
+
 function addUtcDaysV3(date, days) {
   return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 }
@@ -1384,8 +1388,15 @@ function getMonthRangeLabelV3(monthKey) {
   const year = Number(parts[0]);
   const month = Number(parts[1]);
   if (!year || !month) return monthKey || '-';
+  const firstDate = new Date(Date.UTC(year, month - 1, 1));
   const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return monthKey + ' | ' + pad2V3(month) + '01-' + pad2V3(month) + pad2V3(lastDay);
+  let endDate = new Date(Date.UTC(year, month - 1, lastDay));
+  const latestWeek = WEEK_LABELS[WEEK_LABELS.length - 1];
+  const latestWeekEnd = getWeekEndDateV3(latestWeek);
+  if (monthKey === MONTH_LABELS[MONTH_LABELS.length - 1] && latestWeekEnd && latestWeekEnd < endDate) {
+    endDate = latestWeekEnd;
+  }
+  return monthKey + ' | ' + formatUtcMMDDRangeV3(firstDate, endDate, '~');
 }
 
 function getIsoWeekStartV3(year, week) {
@@ -1403,12 +1414,18 @@ function parseWeekKeyV3(weekKey) {
   return { year, week: Number(match[2]) };
 }
 
+function getWeekEndDateV3(weekKey) {
+  const parsed = parseWeekKeyV3(weekKey);
+  if (!parsed) return null;
+  return addUtcDaysV3(getIsoWeekStartV3(parsed.year, parsed.week), 6);
+}
+
 function getWeekRangeLabelV3(weekKey) {
   const parsed = parseWeekKeyV3(weekKey);
   if (!parsed) return weekKey || '-';
   const start = getIsoWeekStartV3(parsed.year, parsed.week);
-  const end = addUtcDaysV3(start, 6);
-  return weekKey + ' | ' + formatUtcMMDDV3(start) + '-' + formatUtcMMDDV3(end);
+  const end = getWeekEndDateV3(weekKey);
+  return weekKey + ' | ' + formatUtcMMDDRangeV3(start, end, '-');
 }
 
 function getWeekSpanLabelV3(weekLabels) {
@@ -1554,7 +1571,7 @@ function renderOverviewPage(container) {
       '<div class="overview-panel module-health-panel">' +
         '<div class="overview-panel-head">' +
           '<div class="overview-panel-title">\u6708\u5ea6\u9971\u548c\u5ea6</div>' +
-          '<div class="overview-panel-subtitle">' + OVERVIEW_TEXT_V3.latestMonth + ' ' + monthRangeLabel + '</div>' +
+          '<div class="overview-panel-subtitle period-range-callout overview-period-callout">' + OVERVIEW_TEXT_V3.latestMonth + ' ' + monthRangeLabel + '</div>' +
         '</div>' +
       '<div class="module-health-grid">' +
         model.cards.map((card, idx) => buildOverviewCardHtmlV2(card, idx, monthRangeLabel)).join('') +
@@ -1619,11 +1636,16 @@ function renderModuleShell(container) {
   const activeIdx = MODULE_INDEX[activeModule];
   const monthlyDisplay = appState.modulePeriod === 'monthly' ? '' : ' style="display:none"';
   const weeklyDisplay = appState.modulePeriod === 'weekly' ? '' : ' style="display:none"';
+  const latestWeek = WEEK_LABELS[WEEK_LABELS.length - 1] || '';
+  const latestWeekHint = appState.modulePeriod === 'weekly' && latestWeek
+    ? '<div class="period-range-callout">最新周 ' + getWeekRangeLabelV3(latestWeek) + '</div>'
+    : '<div class="period-range-callout period-range-callout-placeholder"></div>';
 
   container.innerHTML =
     '<section class="module-page module-page-v2">' +
       '<div class="module">' +
         '<div class="module-header module-toolbar">' +
+          latestWeekHint +
           '<div class="toggle-btns">' +
             '<button class="toggle-btn' + (appState.modulePeriod === 'monthly' ? ' active' : '') + '" onclick="switchModulePeriod(\'monthly\')">\u6708\u5ea6</button>' +
             '<button class="toggle-btn' + (appState.modulePeriod === 'weekly' ? ' active' : '') + '" onclick="switchModulePeriod(\'weekly\')">\u5468\u5ea6</button>' +
