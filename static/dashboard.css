@@ -1159,6 +1159,56 @@
     grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 12px;
   }
+  .saturation-legend {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    margin-bottom: 12px;
+    padding: 8px 10px;
+    border: 1px solid #edf2f7;
+    border-radius: 8px;
+    background: #fbfdff;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .saturation-legend-title {
+    color: #64748b;
+    font-weight: 700;
+    margin-right: 2px;
+  }
+  .saturation-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+  }
+  .saturation-legend-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+  }
+  .saturation-legend-label {
+    color: #334155;
+    font-weight: 700;
+  }
+  .saturation-legend-range {
+    color: #64748b;
+    font-weight: 500;
+  }
+  .saturation-legend-item.tone-idle .saturation-legend-dot {
+    background: #c2410c;
+  }
+  .saturation-legend-item.tone-underutilized .saturation-legend-dot {
+    background: #eab308;
+  }
+  .saturation-legend-item.tone-balanced .saturation-legend-dot {
+    background: #059669;
+  }
+  .saturation-legend-item.tone-high .saturation-legend-dot {
+    background: #dc2626;
+  }
   .module-health-panel {
     padding: 18px;
   }
@@ -1541,6 +1591,11 @@
   .overview-panel-subtitle {
     font-size: 12px;
     line-height: 1.35;
+  }
+  .saturation-legend {
+    margin-bottom: 10px;
+    padding: 7px 9px;
+    gap: 7px 12px;
   }
   .module-health-grid {
     grid-template-columns: repeat(5, minmax(0, 1fr));

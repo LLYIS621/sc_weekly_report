@@ -1555,6 +1555,25 @@ function buildOverviewCardHtmlV2(card, idx) {
   '</button>';
 }
 
+function buildSaturationLegendHtmlV3() {
+  const items = [
+    { label: OVERVIEW_TEXT_V3.lowLoad, range: '\u4f4e\u4e8e 80%', tone: 'idle' },
+    { label: OVERVIEW_TEXT_V3.underUtilized, range: '80% \u81f3\u4f4e\u4e8e 100%', tone: 'underutilized' },
+    { label: OVERVIEW_TEXT_V3.balanced, range: '100% \u81f3 120%', tone: 'balanced' },
+    { label: OVERVIEW_TEXT_V3.highLoad, range: '\u9ad8\u4e8e 120%', tone: 'high' }
+  ];
+  return '<div class="saturation-legend" aria-label="\u9971\u548c\u5ea6\u72b6\u6001\u8303\u56f4">' +
+    '<span class="saturation-legend-title">\u9971\u548c\u5ea6\u72b6\u6001\u8303\u56f4</span>' +
+    items.map(item =>
+      '<span class="saturation-legend-item tone-' + item.tone + '">' +
+        '<span class="saturation-legend-dot"></span>' +
+        '<span class="saturation-legend-label">' + item.label + '</span>' +
+        '<span class="saturation-legend-range">' + item.range + '</span>' +
+      '</span>'
+    ).join('') +
+  '</div>';
+}
+
 function buildOverviewModelV2() {
   const monthLabels = MONTH_LABELS.slice(-OVERVIEW_MONTH_WINDOW_V2);
   const weekLabels = WEEK_LABELS.slice(-OVERVIEW_WEEK_WINDOW_V2);
@@ -1611,6 +1630,7 @@ function renderOverviewPage(container) {
           '<div class="overview-panel-title">\u6708\u5ea6\u9971\u548c\u5ea6</div>' +
           '<div class="overview-panel-subtitle period-range-callout overview-period-callout">' + OVERVIEW_TEXT_V3.latestMonth + ' ' + monthRangeLabel + '</div>' +
         '</div>' +
+      buildSaturationLegendHtmlV3() +
       '<div class="module-health-grid">' +
         model.cards.map((card, idx) => buildOverviewCardHtmlV2(card, idx, monthRangeLabel)).join('') +
       '</div>' +
