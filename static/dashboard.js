@@ -655,7 +655,7 @@ function renderModule(moduleName, view, moduleIdx) {
 
     // 左侧KPI摘要
     const lcSummary = document.createElement('div');
-    lcSummary.className = 'metric-summary';
+    lcSummary.className = 'metric-summary cost';
     lcSummary.style.background = 'linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%)';
     lcSummary.style.borderColor = '#fcd34d';
 
@@ -1032,6 +1032,9 @@ const appState = {
   scriptOutputMode: 'write',
 };
 const MODULE_NOTE_STORAGE_KEY = 'creative-weekly-dashboard-module-notes';
+const LONG_IMAGE_SELECTION_STORAGE_KEY = 'creative-weekly-dashboard-long-image-pages';
+const LONG_IMAGE_MAX_DIMENSION = 30000;
+const LONG_IMAGE_CAPTURE_SCALE = 2;
 const standaloneCharts = {};
 
 function escapeHtmlAttr(value) {
@@ -1070,6 +1073,187 @@ function updateModuleToolbarNote(moduleName, value) {
 
 function updateActiveModuleToolbarNote(value) {
   updateModuleToolbarNote(appState.activeModule, value);
+}
+
+function getLongImagePageOptions() {
+  const moduleOptions = MODULE_NAMES.map(moduleName => ({
+    key: 'module:' + moduleName,
+    label: getOverviewDisplayNameV3(moduleName) + '\u8be6\u60c5'
+  }));
+  return [{ key: 'overview', label: '\u603b\u89c8' }]
+    .concat(moduleOptions)
+    .concat([{ key: 'business', label: '\u6295\u5165\u4ea7\u51fa' }]);
+}
+
+function readLongImageSelection() {
+  const validKeys = getLongImagePageOptions().map(item => item.key);
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(LONG_IMAGE_SELECTION_STORAGE_KEY) || '[]');
+    const selected = Array.isArray(stored) ? stored.filter(key => validKeys.includes(key)) : [];
+    return selected.length ? selected : validKeys;
+  } catch (err) {
+    return validKeys;
+  }
+}
+
+function buildLongImageSelectionHtml() {
+  const selectedKeys = readLongImageSelection();
+  return getLongImagePageOptions().map(item =>
+    '<label class="long-image-page-option">' +
+      '<input class="long-image-page-checkbox" type="checkbox" value="' + escapeHtmlAttr(item.key) + '"' +
+        (selectedKeys.includes(item.key) ? ' checked' : '') + ' />' +
+      '<span>' + item.label + '</span>' +
+    '</label>'
+  ).join('');
+}
+
+function openLongImageExportDialog() {
+  const dialog = document.getElementById('longImageExportDialog');
+  if (!dialog) return;
+  const optionList = dialog.querySelector('.long-image-page-list');
+  if (optionList) optionList.innerHTML = buildLongImageSelectionHtml();
+  dialog.hidden = false;
+}
+
+function closeLongImageExportDialog() {
+  const dialog = document.getElementById('longImageExportDialog');
+  if (dialog) dialog.hidden = true;
+}
+
+function getCheckedLongImagePages() {
+  const dialog = document.getElementById('longImageExportDialog');
+  if (!dialog) return [];
+  return Array.from(dialog.querySelectorAll('.long-image-page-checkbox:checked')).map(input => input.value);
+}
+
+function showLongImageExportProgress(message) {
+  let progress = document.getElementById('longImageExportProgress');
+  if (!progress) {
+    progress = document.createElement('div');
+    progress.id = 'longImageExportProgress';
+    progress.className = 'long-image-export-progress';
+    progress.innerHTML = '<div class="long-image-export-progress-panel"><span class="long-image-export-spinner"></span><span class="long-image-export-progress-text"></span></div>';
+    document.body.appendChild(progress);
+  }
+  progress.querySelector('.long-image-export-progress-text').textContent = message;
+  progress.hidden = false;
+}
+
+function hideLongImageExportProgress() {
+  const progress = document.getElementById('longImageExportProgress');
+  if (progress) progress.hidden = true;
+}
+
+function getLongImagePageTitle(pageKey) {
+  if (pageKey === 'overview') return '\u603b\u89c8';
+  if (pageKey === 'business') return '\u6295\u5165\u4ea7\u51fa';
+  const moduleName = pageKey.replace('module:', '');
+  return getOverviewDisplayNameV3(moduleName) + '\u8be6\u60c5 | ' + getPeriodText(appState.modulePeriod);
+}
+
+function renderLongImagePage(pageKey) {
+  if (pageKey === 'overview') {
+    appState.mainView = 'overview';
+  } else if (pageKey === 'business') {
+    appState.mainView = 'business';
+  } else {
+    appState.mainView = 'modules';
+    appState.activeModule = pageKey.replace('module:', '');
+  }
+  renderApp();
+  const viewRoot = document.getElementById('viewRoot');
+  const sectionTitle = document.createElement('div');
+  sectionTitle.className = 'long-image-section-title';
+  sectionTitle.textContent = getLongImagePageTitle(pageKey);
+  viewRoot.insertBefore(sectionTitle, viewRoot.firstChild);
+}
+
+function restoreLongImageViewState(savedState) {
+  appState.mainView = savedState.mainView;
+  appState.activeModule = savedState.activeModule;
+  appState.modulePeriod = savedState.modulePeriod;
+  appState.businessTab = savedState.businessTab;
+  renderApp();
+}
+
+function downloadLongImage(canvas) {
+  const link = document.createElement('a');
+  const now = new Date();
+  const stamp = now.getFullYear() + pad2V3(now.getMonth() + 1) + pad2V3(now.getDate());
+  link.download = '\u521b\u610f\u5468\u4f1a\u4eea\u8868\u76d8_\u957f\u56fe_' + stamp + '.png';
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+}
+
+async function exportSelectedPagesAsLongImage() {
+  const pageKeys = getCheckedLongImagePages();
+  if (!pageKeys.length) {
+    window.alert('\u8bf7\u81f3\u5c11\u9009\u62e9\u4e00\u4e2a\u9875\u9762\u3002');
+    return;
+  }
+  if (typeof window.html2canvas !== 'function') {
+    window.alert('\u957f\u56fe\u5bfc\u51fa\u7ec4\u4ef6\u672a\u52a0\u8f7d\uff0c\u8bf7\u68c0\u67e5\u7f51\u7edc\u540e\u5237\u65b0\u9875\u9762\u91cd\u8bd5\u3002');
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(LONG_IMAGE_SELECTION_STORAGE_KEY, JSON.stringify(pageKeys));
+  } catch (err) {
+    // Continue exporting when local storage is unavailable.
+  }
+
+  const savedState = {
+    mainView: appState.mainView,
+    activeModule: appState.activeModule,
+    modulePeriod: appState.modulePeriod,
+    businessTab: appState.businessTab
+  };
+  const previousAnimation = Chart.defaults && Chart.defaults.animation;
+  const captures = [];
+  closeLongImageExportDialog();
+  document.body.classList.add('long-image-export-mode');
+
+  try {
+    if (Chart.defaults) Chart.defaults.animation = false;
+    for (let index = 0; index < pageKeys.length; index += 1) {
+      document.body.classList.toggle('long-image-export-continuation', index > 0);
+      renderLongImagePage(pageKeys[index]);
+      showLongImageExportProgress('\u6b63\u5728\u751f\u6210\u957f\u56fe ' + (index + 1) + '/' + pageKeys.length);
+      await new Promise(resolve => window.setTimeout(resolve, 100));
+      const capture = await window.html2canvas(document.querySelector('.container'), {
+        backgroundColor: '#f8fbfd',
+        scale: LONG_IMAGE_CAPTURE_SCALE,
+        useCORS: true,
+        logging: false
+      });
+      captures.push(capture);
+    }
+
+    const rawWidth = Math.max(...captures.map(canvas => canvas.width));
+    const rawHeight = captures.reduce((total, canvas) => total + canvas.height, 0);
+    const scale = Math.min(1, LONG_IMAGE_MAX_DIMENSION / rawWidth, LONG_IMAGE_MAX_DIMENSION / rawHeight);
+    const resultCanvas = document.createElement('canvas');
+    resultCanvas.width = Math.max(1, Math.round(rawWidth * scale));
+    resultCanvas.height = Math.max(1, Math.round(rawHeight * scale));
+    const context = resultCanvas.getContext('2d');
+    context.fillStyle = '#f8fbfd';
+    context.fillRect(0, 0, resultCanvas.width, resultCanvas.height);
+    let offsetY = 0;
+    captures.forEach(canvas => {
+      const drawHeight = Math.round(canvas.height * scale);
+      context.drawImage(canvas, 0, offsetY, Math.round(canvas.width * scale), drawHeight);
+      offsetY += drawHeight;
+    });
+    downloadLongImage(resultCanvas);
+  } catch (err) {
+    console.error(err);
+    window.alert('\u957f\u56fe\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u5237\u65b0\u9875\u9762\u540e\u91cd\u8bd5\u3002');
+  } finally {
+    if (Chart.defaults) Chart.defaults.animation = previousAnimation;
+    document.body.classList.remove('long-image-export-mode', 'long-image-export-continuation');
+    hideLongImageExportProgress();
+    restoreLongImageViewState(savedState);
+  }
 }
 
 function destroyStandaloneCharts() {
@@ -1683,8 +1867,23 @@ function renderShell() {
         '<button class="top-nav-btn top-nav-primary' + overviewActive + '" type="button" onclick="setMainView(\'overview\')"'+ (overviewActive ? ' aria-current="page"' : '') +'>' + OVERVIEW_TEXT_V3.overview + '</button>' +
         '<div class="top-nav-section" aria-label="素材模块">' + moduleNavButtons + '</div>' +
         '<button class="top-nav-btn top-nav-primary' + businessActive + '" type="button" onclick="setMainView(\'business\')"'+ (businessActive ? ' aria-current="page"' : '') +'>' + OVERVIEW_TEXT_V3.inputOutput + '</button>' +
+        '<button class="top-nav-btn top-nav-export-btn" type="button" onclick="openLongImageExportDialog()">\u5bfc\u51fa\u957f\u56fe</button>' +
       '</div>' +
       '<div id="viewRoot"></div>' +
+      '<div id="longImageExportDialog" class="long-image-export-dialog" hidden onclick="closeLongImageExportDialog()">' +
+        '<div class="long-image-export-panel" role="dialog" aria-modal="true" aria-label="\u5bfc\u51fa\u957f\u56fe" onclick="event.stopPropagation()">' +
+          '<div class="long-image-export-head">' +
+            '<div class="long-image-export-title">\u5bfc\u51fa\u957f\u56fe</div>' +
+            '<button class="long-image-export-close" type="button" aria-label="\u5173\u95ed" onclick="closeLongImageExportDialog()">\u00d7</button>' +
+          '</div>' +
+          '<div class="long-image-export-desc">\u9009\u62e9\u8981\u62fc\u63a5\u7684\u9875\u9762\uff0c\u8be6\u60c5\u9875\u4f7f\u7528\u5f53\u524d\u7684\u6708\u5ea6\u6216\u5468\u5ea6\u89c6\u56fe\u3002</div>' +
+          '<div class="long-image-page-list">' + buildLongImageSelectionHtml() + '</div>' +
+          '<div class="long-image-export-actions">' +
+            '<button class="long-image-export-btn secondary" type="button" onclick="closeLongImageExportDialog()">\u53d6\u6d88</button>' +
+            '<button class="long-image-export-btn primary" type="button" onclick="exportSelectedPagesAsLongImage()">\u751f\u6210\u957f\u56fe</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
     '</div>';
 }
 
