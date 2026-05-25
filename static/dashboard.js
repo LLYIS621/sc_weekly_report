@@ -1031,7 +1031,46 @@ const appState = {
   businessTab: 'roi',
   scriptOutputMode: 'write',
 };
+const MODULE_NOTE_STORAGE_KEY = 'creative-weekly-dashboard-module-notes';
 const standaloneCharts = {};
+
+function escapeHtmlAttr(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function readModuleNotes() {
+  try {
+    const raw = window.localStorage.getItem(MODULE_NOTE_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (err) {
+    return {};
+  }
+}
+
+function getModuleToolbarNote(moduleName) {
+  const notes = readModuleNotes();
+  return typeof notes[moduleName] === 'string' ? notes[moduleName] : '';
+}
+
+function updateModuleToolbarNote(moduleName, value) {
+  try {
+    const notes = readModuleNotes();
+    notes[moduleName] = value;
+    window.localStorage.setItem(MODULE_NOTE_STORAGE_KEY, JSON.stringify(notes));
+  } catch (err) {
+    return;
+  }
+}
+
+function updateActiveModuleToolbarNote(value) {
+  updateModuleToolbarNote(appState.activeModule, value);
+}
 
 function destroyStandaloneCharts() {
   Object.keys(standaloneCharts).forEach(key => {
@@ -1341,7 +1380,6 @@ const OVERVIEW_TEXT_V3 = {
   avgDailyOutput: '\u4eba\u5747\u65e5\u5747\u4ea7\u51fa',
   saturation: '\u9971\u548c\u5ea6',
   matrixTitle: '\u7d20\u6750\u6307\u6807\u77e9\u9635',
-  matrixSubtitle: '\u8fd1\u56db\u5468\u5468\u5ea6\u4fe1\u53f7\uff0c\u4e0d\u5305\u542b ROI \u548c\u4eba\u529b\u6210\u672c\u5224\u65ad\u3002',
   materialType: '\u7d20\u6750\u7c7b\u578b',
   saturationStatus: '\u9971\u548c\u5ea6\u72b6\u6001',
   saturationDrift: '\u8f83\u8fd1\u56db\u5468\u5e38\u6001\u504f\u79bb',
@@ -1459,8 +1497,8 @@ function buildModuleIdentityHtmlV3(moduleName, idx, extraClass) {
 }
 
 function getSaturationPrimaryStatusV2(value) {
-  if (value < 0.8) return { label: OVERVIEW_TEXT_V3.lowLoad, tone: 'low', detail: '低于 80%' };
-  if (value < 1) return { label: OVERVIEW_TEXT_V3.underUtilized, tone: 'low', detail: '80%-100%' };
+  if (value < 0.8) return { label: OVERVIEW_TEXT_V3.lowLoad, tone: 'idle', detail: '低于 80%' };
+  if (value < 1) return { label: OVERVIEW_TEXT_V3.underUtilized, tone: 'underutilized', detail: '80%-100%' };
   if (value <= 1.2) return { label: OVERVIEW_TEXT_V3.balanced, tone: 'balanced', detail: '100%-120%' };
   return { label: OVERVIEW_TEXT_V3.highLoad, tone: 'high', detail: '高于 120%' };
 }
@@ -1482,7 +1520,7 @@ function getMatrixDeviationStatusV2(value, baseline) {
 function getWeeklyOutputTrendStatusV2(latestValue, priorAverage) {
   if (!priorAverage) return { label: OVERVIEW_TEXT_V3.insufficient, tone: 'neutral', detail: '近四周样本不足' };
   if (latestValue < priorAverage * 0.8) return { label: OVERVIEW_TEXT_V3.down, tone: 'low', detail: '较前三周均值低 ' + formatTrendDeltaV2(latestValue / priorAverage) };
-  if (latestValue > priorAverage * 1.2) return { label: OVERVIEW_TEXT_V3.up, tone: 'high', detail: '较前三周均值高 ' + formatTrendDeltaV2(latestValue / priorAverage) };
+  if (latestValue > priorAverage * 1.2) return { label: OVERVIEW_TEXT_V3.up, tone: 'positive', detail: '较前三周均值高 ' + formatTrendDeltaV2(latestValue / priorAverage) };
   return { label: OVERVIEW_TEXT_V3.stable, tone: 'balanced', detail: '与前三周均值接近' };
 }
 
@@ -1512,7 +1550,7 @@ function buildOverviewCardHtmlV2(card, idx) {
       '</div>' +
     '</div>' +
     '<div class="module-health-foot">' +
-      '<span>' + card.baselineHint + '</span>' +
+      '<span class="module-health-hint">' + card.baselineHint + '</span>' +
     '</div>' +
   '</button>';
 }
@@ -1580,7 +1618,6 @@ function renderOverviewPage(container) {
       '<div class="overview-panel overview-matrix-panel">' +
         '<div class="overview-panel-head">' +
           '<div class="overview-panel-title">\u5468\u5ea6\u9971\u548c\u5ea6</div>' +
-          '<div class="overview-panel-subtitle">' + OVERVIEW_TEXT_V3.matrixSubtitle + '</div>' +
         '</div>' +
         '<div class="overview-matrix-wrap">' +
           '<table class="overview-matrix-table">' +
@@ -1637,15 +1674,22 @@ function renderModuleShell(container) {
   const monthlyDisplay = appState.modulePeriod === 'monthly' ? '' : ' style="display:none"';
   const weeklyDisplay = appState.modulePeriod === 'weekly' ? '' : ' style="display:none"';
   const latestWeek = WEEK_LABELS[WEEK_LABELS.length - 1] || '';
+  const moduleToolbarNote = getModuleToolbarNote(activeModule);
   const latestWeekHint = appState.modulePeriod === 'weekly' && latestWeek
     ? '<div class="period-range-callout">最新周 ' + getWeekRangeLabelV3(latestWeek) + '</div>'
-    : '<div class="period-range-callout period-range-callout-placeholder"></div>';
+    : '';
+  const moduleToolbarNoteInput =
+    '<input class="module-toolbar-note-input" type="text" value="' + escapeHtmlAttr(moduleToolbarNote) + '" ' +
+    'placeholder="输入本页说明" oninput="updateActiveModuleToolbarNote(this.value)" />';
 
   container.innerHTML =
     '<section class="module-page module-page-v2">' +
       '<div class="module">' +
         '<div class="module-header module-toolbar">' +
-          latestWeekHint +
+          '<div class="module-toolbar-left">' +
+            latestWeekHint +
+            moduleToolbarNoteInput +
+          '</div>' +
           '<div class="toggle-btns">' +
             '<button class="toggle-btn' + (appState.modulePeriod === 'monthly' ? ' active' : '') + '" onclick="switchModulePeriod(\'monthly\')">\u6708\u5ea6</button>' +
             '<button class="toggle-btn' + (appState.modulePeriod === 'weekly' ? ' active' : '') + '" onclick="switchModulePeriod(\'weekly\')">\u5468\u5ea6</button>' +

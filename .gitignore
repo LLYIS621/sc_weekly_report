@@ -29,3 +29,6 @@ data/
 # 忽略EXCEL文档
 *.xlsx
 *.xls
+
+# 忽略py文件
+*.py
