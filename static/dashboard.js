@@ -1034,7 +1034,7 @@ const appState = {
 const MODULE_NOTE_STORAGE_KEY = 'creative-weekly-dashboard-module-notes';
 const LONG_IMAGE_SELECTION_STORAGE_KEY = 'creative-weekly-dashboard-long-image-pages';
 const LONG_IMAGE_MAX_DIMENSION = 30000;
-const LONG_IMAGE_CAPTURE_SCALE = 2;
+const LONG_IMAGE_CAPTURE_SCALE = 3;
 const standaloneCharts = {};
 
 function escapeHtmlAttr(value) {
