@@ -1,7 +1,9 @@
 ﻿const DATA = window.DASHBOARD_PAYLOAD.DATA;
+const LABOR_COST_DATA = window.DASHBOARD_PAYLOAD.LABOR_COST_DATA || {};
 const STRUCTURE_DATA = window.DASHBOARD_PAYLOAD.STRUCTURE_DATA;
 const EFFICIENCY_ANALYSIS_DATA = window.DASHBOARD_PAYLOAD.EFFICIENCY_ANALYSIS_DATA;
 const MONTH_LABELS = window.DASHBOARD_PAYLOAD.MONTH_LABELS;
+const LABOR_COST_MONTH_LABELS = window.DASHBOARD_PAYLOAD.LABOR_COST_MONTH_LABELS || [];
 const WEEK_LABELS = window.DASHBOARD_PAYLOAD.WEEK_LABELS;
 const ROI_DATA = window.DASHBOARD_PAYLOAD.ROI_DATA;
 const ROI_COLORS = ['#007A8C','#0091A5','#00A3B8','#047857','#0f766e'];
@@ -126,6 +128,25 @@ function formatOutputText(value) {
   if (value === null || value === undefined) return '-';
   const num = Number(value);
   return (num % 1 === 0 ? num.toFixed(0) : num.toFixed(1));
+}
+
+function getSettledLaborCostMonths() {
+  return LABOR_COST_MONTH_LABELS.filter(month => LABOR_COST_MODULES.some(moduleName => {
+    const moduleData = LABOR_COST_DATA[moduleName];
+    const metrics = moduleData && moduleData.total_metrics ? moduleData.total_metrics[month] : null;
+    return metrics && Number(metrics.single_labor_cost) > 0;
+  }));
+}
+
+function getLaborCostDisplayContext(moduleName) {
+  const data = LABOR_COST_DATA[moduleName];
+  if (!data) return null;
+  const labels = getSettledLaborCostMonths().filter(month => {
+    const metrics = data.total_metrics[month];
+    return metrics && Number(metrics.single_labor_cost) > 0;
+  });
+  if (!labels.length) return null;
+  return { data, labels, latestMonth: labels[labels.length - 1] };
 }
 
 function calcChange(vals) {
@@ -633,11 +654,25 @@ function renderModule(moduleName, view, moduleIdx) {
     }
   });
 
-  // --- 单素材人力成本区块（仅月度、仅图片/混剪） ---
-  if (view === 'monthly' && LABOR_COST_MODULES.indexOf(moduleName) !== -1) {
+  // --- 单素材人力成本区块（月度结算口径，月度/周度页均展示） ---
+  const laborCostView = LABOR_COST_MODULES.indexOf(moduleName) !== -1
+    ? getLaborCostDisplayContext(moduleName)
+    : null;
+  if (laborCostView) {
     const lcm = LABOR_COST_METRIC;
     const lcmUnit = LABOR_COST_UNIT[moduleName] || '元';
     const lcmLabel = lcm.label + ' <span class="summary-unit">' + lcmUnit + '</span>';
+    const lcData = laborCostView.data;
+    const lcLabels = laborCostView.labels;
+    const lcDeptNames = lcData.depts;
+    const lcLineItems = [];
+    if (lcData.show_total !== false) {
+      lcLineItems.push({name: '总计', metrics: lcData.total_metrics, color: TOTAL_COLOR, isTotal: true});
+    }
+    lcDeptNames.forEach((dept, di) => {
+      lcLineItems.push({name: dept, metrics: lcData.dept_metrics[dept],
+                        color: DEPT_COLORS[di % DEPT_COLORS.length], isTotal: false});
+    });
 
     const lcGroup = document.createElement('div');
     lcGroup.className = 'metric-group';
@@ -646,8 +681,9 @@ function renderModule(moduleName, view, moduleIdx) {
       '<div class="group-title-wrap">' +
       '<div class="group-icon" style="background:linear-gradient(135deg,#f59e0b,#fbbf24);color:#fff">&#128176;</div>' +
       '<span class="group-label">成本指标</span>' +
-      '<span class="group-desc"> — 单素材人力成本</span>' +
+      '<span class="group-desc"> — 单素材人力成本（月度结算）</span>' +
       '</div>' +
+      '<span class="cost-period-note">最新成本月 ' + laborCostView.latestMonth + '</span>' +
       '</div>';
 
     const lcRow = document.createElement('div');
@@ -659,7 +695,7 @@ function renderModule(moduleName, view, moduleIdx) {
     lcSummary.style.background = 'linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%)';
     lcSummary.style.borderColor = '#fcd34d';
 
-    const lcTotalVals = labels.map(l => data.total_metrics[l] ? (data.total_metrics[l][lcm.key] || 0) : 0);
+    const lcTotalVals = lcLabels.map(l => lcData.total_metrics[l] ? (lcData.total_metrics[l][lcm.key] || 0) : 0);
     const lcTotalCh = calcChange(lcTotalVals);
 
     let lcSumHTML =
@@ -670,8 +706,8 @@ function renderModule(moduleName, view, moduleIdx) {
         (lcTotalCh.dir === 'up' ? '&#9650;' : '&#9660;') + ' ' + Math.abs(lcTotalCh.pct) + '% 环比</div>';
     }
     lcSumHTML += '<div class="summary-depts">';
-    deptNames.forEach((d, i) => {
-      const vals = labels.map(l => data.dept_metrics[d][l] ? (data.dept_metrics[d][l][lcm.key] || 0) : 0);
+    lcDeptNames.forEach((d, i) => {
+      const vals = lcLabels.map(l => lcData.dept_metrics[d][l] ? (lcData.dept_metrics[d][l][lcm.key] || 0) : 0);
       const ch = calcChange(vals);
       lcSumHTML += '<div class="summary-dept-row">' +
         '<span class="summary-dept-name"><span class="summary-dept-dot" style="background:' + DEPT_COLORS[i % DEPT_COLORS.length] + '"></span>' +
@@ -690,14 +726,14 @@ function renderModule(moduleName, view, moduleIdx) {
 
     let lcSharedMax = 0;
     let lcAvgLine = null;
-    lineItems.forEach(item => {
-      labels.forEach(l => {
+    lcLineItems.forEach(item => {
+      lcLabels.forEach(l => {
         const v = item.metrics[l];
         if (v && v[lcm.key] !== undefined) lcSharedMax = Math.max(lcSharedMax, v[lcm.key]);
       });
     });
     // 均值线（用总计的均值）— 原：动态计算
-    if (data.total_metrics) {
+    if (lcData.total_metrics) {
       const lcValidVals = lcTotalVals.filter(v => v > 0);
       // 原：if (lcValidVals.length > 0) lcAvgLine = lcValidVals.reduce((a,b)=>a+b,0) / lcValidVals.length;
       if (lcValidVals.length > 0) lcAvgLine = lcValidVals.reduce((a,b)=>a+b,0) / lcValidVals.length;
@@ -706,10 +742,10 @@ function renderModule(moduleName, view, moduleIdx) {
     lcAvgLine = null;
     lcSharedMax = lcSharedMax * 1.25 || 1;
 
-    lineItems.forEach((item, idx) => {
+    lcLineItems.forEach((item, idx) => {
       const card = document.createElement('div');
       card.className = 'chart-card' + (item.isTotal ? ' is-total' : '');
-      if (data.show_total !== false && idx === 1) {
+      if (lcData.show_total !== false && idx === 1) {
         card.style.marginLeft = '15px';
       }
       card.innerHTML = buildChartCardHeader(item.name, '', moduleName, item.isTotal ? '\u5168\u90e8' : item.name, null);
@@ -722,7 +758,7 @@ function renderModule(moduleName, view, moduleIdx) {
       card.appendChild(box);
       lcChartsRow.appendChild(card);
 
-      createLineChart(canvasId, canvas.getContext('2d'), item, lcm, labels, lcSharedMax, lcAvgLine, data.show_total !== false, moduleName);
+      createLineChart(canvasId, canvas.getContext('2d'), item, lcm, lcLabels, lcSharedMax, lcAvgLine, lcData.show_total !== false, moduleName);
     });
 
     lcRow.appendChild(lcSummary);
@@ -1302,30 +1338,33 @@ function renderBusinessPage(container) {
 }
 
 function renderLaborCostTopic(container) {
-  const latestMonth = MONTH_LABELS[MONTH_LABELS.length - 1];
+  const settledMonths = getSettledLaborCostMonths();
+  const latestMonth = settledMonths[settledMonths.length - 1] || '';
   const cards = LABOR_COST_MODULES.map(moduleName => {
-    const value = DATA.monthly[moduleName].total_metrics[latestMonth] ? (DATA.monthly[moduleName].total_metrics[latestMonth].single_labor_cost || 0) : 0;
+    const costView = getLaborCostDisplayContext(moduleName);
+    const costMonth = costView ? costView.latestMonth : latestMonth;
+    const value = costView && costView.data.total_metrics[costMonth] ? (costView.data.total_metrics[costMonth].single_labor_cost || 0) : 0;
     return '<div class="overview-card business-card">' +
       '<div class="overview-card-label">' + moduleName + '单素材人力成本</div>' +
       '<div class="overview-card-value num">' + fmtVal(value, 'single_labor_cost') + ' ' + LABOR_COST_UNIT[moduleName] + '</div>' +
-      '<div class="overview-card-hint">取最近月份总计口径</div>' +
+      '<div class="overview-card-hint">最新成本月 ' + (costMonth || '-') + ' | 月度结算</div>' +
     '</div>';
   }).join('');
 
   container.innerHTML =
     '<div class="business-cost-page">' +
       '<div class="overview-kpis">' + cards + '</div>' +
-      '<div class="overview-panel business-panel"><div class="overview-panel-title">近四月单素材人力成本趋势</div><div class="overview-chart-box"><canvas id="laborCostTrendChart"></canvas></div></div>' +
+      '<div class="overview-panel business-panel"><div class="overview-panel-title">已结算月单素材人力成本趋势</div><div class="overview-chart-box"><canvas id="laborCostTrendChart"></canvas></div></div>' +
     '</div>';
 
   const ctx = document.getElementById('laborCostTrendChart').getContext('2d');
   standaloneCharts.laborCostTrendChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: MONTH_LABELS,
+      labels: settledMonths,
       datasets: LABOR_COST_MODULES.map((moduleName, idx) => ({
         label: moduleName,
-        data: MONTH_LABELS.map(month => {
+        data: settledMonths.map(month => {
           const monthMetrics = DATA.monthly[moduleName].total_metrics[month];
           return monthMetrics ? (monthMetrics.single_labor_cost || 0) : 0;
         }),
