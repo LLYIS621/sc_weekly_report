@@ -1,7 +1,9 @@
 ﻿const DATA = window.DASHBOARD_PAYLOAD.DATA;
 const LABOR_COST_DATA = window.DASHBOARD_PAYLOAD.LABOR_COST_DATA || {};
+const ANOMALY_REASON_DATA = window.DASHBOARD_PAYLOAD.ANOMALY_REASON_DATA || {monthly: {}, weekly: {}};
 const STRUCTURE_DATA = window.DASHBOARD_PAYLOAD.STRUCTURE_DATA;
 const EFFICIENCY_ANALYSIS_DATA = window.DASHBOARD_PAYLOAD.EFFICIENCY_ANALYSIS_DATA;
+const PERSON_EFFICIENCY_DATA = window.DASHBOARD_PAYLOAD.PERSON_EFFICIENCY_DATA || {};
 const MONTH_LABELS = window.DASHBOARD_PAYLOAD.MONTH_LABELS;
 const LABOR_COST_MONTH_LABELS = window.DASHBOARD_PAYLOAD.LABOR_COST_MONTH_LABELS || [];
 const WEEK_LABELS = window.DASHBOARD_PAYLOAD.WEEK_LABELS;
@@ -25,6 +27,7 @@ const EFFICIENCY_METRICS = [
 const LABOR_COST_MODULES = ['图片', '混剪'];
 const LABOR_COST_UNIT = {'图片': '元/张', '混剪': '元/条'};
 const LABOR_COST_METRIC = {key: 'single_labor_cost', label: '单素材人力成本', unit: '元'};
+const CONTENT_EDITING_MODULE = '内容团队-剪辑';
 const SCRIPT_MODULE = '内容团队-编剧';
 const NARROW_OUTPUT_BAR_MODULES = ['内容团队-编剧', '内容团队-导演', '内容团队-摄像', '内容团队-剪辑'];
 const SCRIPT_OUTPUT_MODES = {
@@ -190,6 +193,192 @@ function buildSummaryHTML(m, data, labels, isEfficiency, deptNames, moduleName) 
   });
   html += '</div>';
   return html;
+}
+
+function getAnomalyViewData(moduleName, view) {
+  return ANOMALY_REASON_DATA[view] && ANOMALY_REASON_DATA[view][moduleName]
+    ? ANOMALY_REASON_DATA[view][moduleName]
+    : null;
+}
+
+function getAnomalyReasonText(moduleName, view, metricKey, dept) {
+  const item = getAnomalyReasonItem(moduleName, view, metricKey, dept);
+  return item.text || '';
+}
+
+function getAnomalyReasonItem(moduleName, view, metricKey, dept) {
+  const viewData = getAnomalyViewData(moduleName, view);
+  const metricData = viewData && viewData[metricKey];
+  const item = metricData && metricData[dept];
+  if (!item) return {headline: '', detail: '', text: ''};
+  const headline = item.headline || '';
+  const detail = item.detail || '';
+  const text = item.text || (headline && detail ? headline + '<br>' + detail : headline || detail);
+  return {headline, detail, text};
+}
+
+function extractCommonCauseFragments(text) {
+  const fragments = [];
+  const patterns = [
+    /工作日(?:减少|增加)<span class="anomaly-delta (?:down|up)">[^<]+<\/span>/g,
+    /产出用人力(?:减少|增加)<span class="anomaly-delta (?:down|up)">[^<]+<\/span>/g
+  ];
+  patterns.forEach(pattern => {
+    const matches = text.match(pattern) || [];
+    matches.forEach(match => {
+      if (fragments.indexOf(match) < 0) fragments.push(match);
+    });
+  });
+  return fragments;
+}
+
+function removeCommonCauseFragments(text, fragments) {
+  let result = text;
+  fragments.forEach(fragment => {
+    result = result.replace('、' + fragment, '');
+    result = result.replace(fragment + '、', '');
+    result = result.replace(fragment, '');
+  });
+  result = result.replace(/主要因\s*。/g, '。');
+  result = result.replace(/，\s*。/g, '。');
+  result = result.replace(/、\s*。/g, '。');
+  result = result.replace(/，主要因(?=<br>|$)/g, '');
+  return result;
+}
+
+function normalizeManpowerCauseFragment(fragment) {
+  const match = fragment.match(/^(产出用人力(?:减少|增加))<span class="anomaly-delta (down|up)">([^<]+)人<\/span>$/);
+  if (!match) return fragment;
+  const value = Math.abs(parseFloat(match[3]));
+  if (!Number.isFinite(value) || value < 0.5) return '';
+  return match[1] + '<span class="anomaly-delta ' + match[2] + '">' + value.toFixed(2) + '人</span>';
+}
+
+function normalizeCauseFragments(fragments) {
+  return fragments.map(fragment => {
+    return fragment.indexOf('产出用人力') === 0 ? normalizeManpowerCauseFragment(fragment) : fragment;
+  }).filter(Boolean);
+}
+
+function buildAvgDailyCommonText(reasonPairs, commonFragments) {
+  const workdayFragment = commonFragments.find(fragment => fragment.indexOf('工作日') === 0);
+  if (!workdayFragment) {
+    const normalizedFragments = normalizeCauseFragments(commonFragments);
+    return normalizedFragments.length ? '各部门均受' + normalizedFragments.join('、') + '影响。' : '';
+  }
+  return '因' + workdayFragment + '，人均日均产出与总产出的变动幅度出现差异。';
+}
+
+function getAnomalyReasonBreakdown(moduleName, view, metricKey, lineItems) {
+  const deptItems = lineItems.filter(item => !item.isTotal);
+  const empty = {commonText: '', deptReasons: {}};
+  if (deptItems.length <= 1) return empty;
+  const reasonPairs = deptItems.map(item => ({
+    name: item.name,
+    reason: getAnomalyReasonItem(moduleName, view, metricKey, item.name)
+  }));
+  if (reasonPairs.some(pair => !pair.reason.text)) return empty;
+  const firstKey = [reasonPairs[0].reason.headline || '', reasonPairs[0].reason.detail || '', reasonPairs[0].reason.text || ''].join('|');
+  const isSameReason = reasonPairs.every(pair => [pair.reason.headline || '', pair.reason.detail || '', pair.reason.text || ''].join('|') === firstKey);
+  if (isSameReason) {
+    const deptReasons = {};
+    deptItems.forEach(item => { deptReasons[item.name] = {headline: '', detail: '', text: ''}; });
+    if (metricKey === 'avg_daily_output' || metricKey === 'handoff_avg_daily_output') {
+      const sameFragments = extractCommonCauseFragments(reasonPairs[0].reason.text);
+      const commonText = buildAvgDailyCommonText(reasonPairs, sameFragments);
+      if (commonText) return {commonText, deptReasons};
+    }
+    return {commonText: reasonPairs[0].reason.text, deptReasons};
+  }
+
+  if (metricKey !== 'avg_daily_output' && metricKey !== 'handoff_avg_daily_output') return empty;
+  const commonFragments = extractCommonCauseFragments(reasonPairs[0].reason.text)
+    .filter(fragment => reasonPairs.every(pair => pair.reason.text.indexOf(fragment) >= 0));
+  if (!commonFragments.length) return empty;
+  const deptReasons = {};
+  reasonPairs.forEach(pair => {
+    const text = removeCommonCauseFragments(pair.reason.text, commonFragments);
+    const extraFragments = normalizeCauseFragments(extractCommonCauseFragments(text));
+    deptReasons[pair.name] = {headline: '', detail: '', text: extraFragments.length ? '同时受' + extraFragments.join('、') + '影响。' : ''};
+  });
+  return {
+    commonText: buildAvgDailyCommonText(reasonPairs, commonFragments),
+    deptReasons
+  };
+}
+
+function renderAnomalyTotalCell(rangeLabel) {
+  return '<div class="anomaly-brief-cell is-total-empty">' +
+    '<div class="anomaly-brief-side-title">波动分析</div>' +
+    (rangeLabel ? '<div class="anomaly-brief-range">' + escapeHtml(rangeLabel) + '</div>' : '') +
+  '</div>';
+}
+
+function buildAnomalyBriefRow(moduleName, view, metricKey, data, lineItems, hasSummarySpacer) {
+  if (!appState.anomalyBriefVisible) return '';
+  const depts = data.depts || [];
+  const hasReason = depts.some(dept => getAnomalyReasonText(moduleName, view, metricKey, dept));
+  if (!hasReason) return '';
+  const viewData = getAnomalyViewData(moduleName, view);
+  const meta = metricKey === 'single_labor_cost' && viewData && viewData.labor_cost_meta ? viewData.labor_cost_meta : (viewData && viewData.meta);
+  const rangeLabel = meta && meta.label ? meta.label : '';
+  const hasTotalItem = lineItems.some(item => item.isTotal);
+  const topNote = hasTotalItem ? '' : '<div class="anomaly-brief-top-note">' +
+    '<span class="anomaly-brief-side-title">波动分析</span>' +
+    (rangeLabel ? '<span class="anomaly-brief-range">' + escapeHtml(rangeLabel) + '</span>' : '') +
+  '</div>';
+  const commonBreakdown = getAnomalyReasonBreakdown(moduleName, view, metricKey, lineItems);
+  const hasCommonReason = Boolean(commonBreakdown.commonText);
+  const deptItems = lineItems.filter(item => !item.isTotal);
+  const renderDeptCells = (reasonMap, rowIndex, firstDeptColumn) => deptItems.map((item, idx) => {
+    const reason = reasonMap ? reasonMap[item.name] || {headline: '', detail: '', text: ''} : getAnomalyReasonItem(moduleName, view, metricKey, item.name);
+    const gridStyle = rowIndex ? ' style="grid-column:' + (firstDeptColumn + idx) + ';grid-row:' + rowIndex + ';"' : '';
+    const firstDeptClass = firstDeptColumn === 1 && idx === 0 ? ' is-first-dept' : '';
+    return '<div class="anomaly-brief-cell' + firstDeptClass + (reason.text ? '' : ' is-empty') + '"' + gridStyle + '>' +
+      (reason.text ? '<div class="anomaly-brief-dept-line"><div class="anomaly-brief-dept">' + escapeHtml(item.name) + '</div>' +
+        (reason.headline ? '<div class="anomaly-brief-headline">' + reason.headline + '</div>' : '') +
+        '</div><div class="anomaly-brief-text">' + (reason.detail || reason.text) + '</div>' : '') +
+    '</div>';
+  }).join('');
+  const firstDeptColumn = hasTotalItem ? 2 : 1;
+  const deptSpecificCells = hasCommonReason ? renderDeptCells(commonBreakdown.deptReasons, 2, firstDeptColumn) : '';
+  const hasDeptSpecificReason = hasCommonReason && Object.keys(commonBreakdown.deptReasons).some(dept => commonBreakdown.deptReasons[dept].text);
+  const deptCount = deptItems.length || 1;
+  const totalCell = hasTotalItem
+    ? '<div class="anomaly-brief-cell is-total-empty" style="grid-column:1;grid-row:1 / span ' + (hasDeptSpecificReason ? 2 : 1) + ';">' +
+        '<div class="anomaly-brief-side-title">波动分析</div>' +
+        (rangeLabel ? '<div class="anomaly-brief-range">' + escapeHtml(rangeLabel) + '</div>' : '') +
+      '</div>'
+    : '';
+  const commonCells = hasCommonReason ? (
+    totalCell +
+    '<div class="anomaly-brief-common-row' + (hasTotalItem ? ' has-leading-divider' : '') + (hasDeptSpecificReason ? ' has-dept-specific' : '') + '"' +
+      ' style="grid-column:' + firstDeptColumn + ' / span ' + deptCount + ';grid-row:1;">' +
+      '<span class="anomaly-brief-common-label">各部门共性</span>' +
+      '<span class="anomaly-brief-text">' + commonBreakdown.commonText + '</span>' +
+    '</div>' +
+    (hasDeptSpecificReason ? deptSpecificCells : '')
+  ) : '';
+  const cells = hasCommonReason ? commonCells : lineItems.map(item => {
+    if (item.isTotal) {
+      return renderAnomalyTotalCell(rangeLabel);
+    }
+    const reason = getAnomalyReasonItem(moduleName, view, metricKey, item.name);
+    return '<div class="anomaly-brief-cell' + (reason.text ? '' : ' is-empty') + '">' +
+      (reason.text ? '<div class="anomaly-brief-dept-line"><div class="anomaly-brief-dept">' + escapeHtml(item.name) + '</div>' +
+        (reason.headline ? '<div class="anomaly-brief-headline">' + reason.headline + '</div>' : '') +
+        '</div><div class="anomaly-brief-text">' + (reason.detail || reason.text) + '</div>' : '') +
+    '</div>';
+  }).join('');
+  return '<div class="metric-row anomaly-brief-row">' +
+    (hasSummarySpacer ? '<div class="metric-summary anomaly-brief-summary-spacer"></div>' : '') +
+    '<div class="charts-row anomaly-brief-grid">' +
+      '<div class="anomaly-brief-band">' +
+        topNote +
+        '<div class="anomaly-brief-cells' + (hasCommonReason ? ' has-common' : '') + '" style="grid-template-columns:repeat(' + lineItems.length + ', minmax(180px, 1fr));">' + cells + '</div>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
 }
 
 // ===== 创建折线图的公共配置 =====
@@ -510,6 +699,7 @@ function renderModule(moduleName, view, moduleIdx) {
     if(summary) row.appendChild(summary);
     row.appendChild(chartsRow);
     outputGroup.appendChild(row);
+    outputGroup.insertAdjacentHTML('beforeend', buildAnomalyBriefRow(moduleName, view, m.key, data, lineItems, Boolean(summary)));
   });
 
   // --- 产出分析区块（产出指标和效率指标之间） ---
@@ -619,6 +809,9 @@ function renderModule(moduleName, view, moduleIdx) {
     if(summary) row.appendChild(summary);
     row.appendChild(chartsRow);
     effGroup.appendChild(row);
+    if (m.key === 'single_time') {
+      effGroup.insertAdjacentHTML('beforeend', buildAnomalyBriefRow(moduleName, view, m.key, data, lineItems, Boolean(summary)));
+    }
 
     if (m.key === 'single_time') {
       const effState = _efficiencyAnalysisState[moduleName];
@@ -764,6 +957,7 @@ function renderModule(moduleName, view, moduleIdx) {
     lcRow.appendChild(lcSummary);
     lcRow.appendChild(lcChartsRow);
     lcGroup.appendChild(lcRow);
+    lcGroup.insertAdjacentHTML('beforeend', buildAnomalyBriefRow(moduleName, view, lcm.key, lcData, lcLineItems, true));
     container.appendChild(lcGroup);
   }
 }
@@ -1064,8 +1258,21 @@ const appState = {
   mainView: 'overview',
   activeModule: MODULE_NAMES[0],
   modulePeriod: 'monthly',
+  anomalyBriefVisible: true,
   businessTab: 'roi',
   scriptOutputMode: 'write',
+  personPeriod: '总体',
+  personBusinessUnit: '总计',
+  personDept: '全部',
+  personClass: '全部',
+  projectBusinessUnit: '全部',
+  projectDemandType: '全部',
+  projectDept: '全部',
+  projectClass: '全部',
+  projectShowLowDemand: false,
+  personExpandedKey: '',
+  personProjectDetailExpandedKey: '',
+  personProjectExpanded: 0,
 };
 const MODULE_NOTE_STORAGE_KEY = 'creative-weekly-dashboard-module-notes';
 const LONG_IMAGE_SELECTION_STORAGE_KEY = 'creative-weekly-dashboard-long-image-pages';
@@ -1079,6 +1286,15 @@ function escapeHtmlAttr(value) {
     .replace(/"/g, '&quot;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+function escapeHtml(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function readModuleNotes() {
@@ -1118,7 +1334,7 @@ function getLongImagePageOptions() {
   }));
   return [{ key: 'overview', label: '\u603b\u89c8' }]
     .concat(moduleOptions)
-    .concat([{ key: 'business', label: '\u6295\u5165\u4ea7\u51fa' }]);
+    .concat([{ key: 'business', label: '\u6295\u5165\u4ea7\u51fa' }, { key: 'person', label: '\u4eba\u5458\u6548\u7387' }]);
 }
 
 function readLongImageSelection() {
@@ -1183,6 +1399,7 @@ function hideLongImageExportProgress() {
 function getLongImagePageTitle(pageKey) {
   if (pageKey === 'overview') return '\u603b\u89c8';
   if (pageKey === 'business') return '\u6295\u5165\u4ea7\u51fa';
+  if (pageKey === 'person') return '\u4eba\u5458\u6548\u7387';
   const moduleName = pageKey.replace('module:', '');
   return getOverviewDisplayNameV3(moduleName) + '\u8be6\u60c5 | ' + getPeriodText(appState.modulePeriod);
 }
@@ -1192,6 +1409,8 @@ function renderLongImagePage(pageKey) {
     appState.mainView = 'overview';
   } else if (pageKey === 'business') {
     appState.mainView = 'business';
+  } else if (pageKey === 'person') {
+    appState.mainView = 'person';
   } else {
     appState.mainView = 'modules';
     appState.activeModule = pageKey.replace('module:', '');
@@ -1209,6 +1428,10 @@ function restoreLongImageViewState(savedState) {
   appState.activeModule = savedState.activeModule;
   appState.modulePeriod = savedState.modulePeriod;
   appState.businessTab = savedState.businessTab;
+  appState.personPeriod = savedState.personPeriod || appState.personPeriod;
+  appState.personBusinessUnit = savedState.personBusinessUnit || appState.personBusinessUnit;
+  appState.personDept = savedState.personDept || appState.personDept;
+  appState.personClass = savedState.personClass || appState.personClass;
   renderApp();
 }
 
@@ -1242,7 +1465,11 @@ async function exportSelectedPagesAsLongImage() {
     mainView: appState.mainView,
     activeModule: appState.activeModule,
     modulePeriod: appState.modulePeriod,
-    businessTab: appState.businessTab
+    businessTab: appState.businessTab,
+    personPeriod: appState.personPeriod,
+    personBusinessUnit: appState.personBusinessUnit,
+    personDept: appState.personDept,
+    personClass: appState.personClass
   };
   const previousAnimation = Chart.defaults && Chart.defaults.animation;
   const captures = [];
@@ -1517,6 +1744,8 @@ function renderApp() {
     renderOverviewPage(viewRoot);
   } else if (appState.mainView === 'modules') {
     renderModuleShell(viewRoot);
+  } else if (appState.mainView === 'person') {
+    renderPersonEfficiencyPage(viewRoot);
   } else {
     renderBusinessPage(viewRoot);
   }
@@ -1543,6 +1772,11 @@ function switchModulePeriod(view) {
   renderApp();
 }
 
+function toggleAnomalyBrief() {
+  appState.anomalyBriefVisible = !appState.anomalyBriefVisible;
+  renderApp();
+}
+
 function switchScriptOutputMode(mode) {
   if (!SCRIPT_OUTPUT_MODES[mode] || appState.scriptOutputMode === mode) return;
   appState.scriptOutputMode = mode;
@@ -1554,6 +1788,1264 @@ function switchScriptOutputMode(mode) {
 function setBusinessTab(tab) {
   appState.businessTab = tab;
   renderApp();
+}
+
+function setPersonPeriod(period) {
+  appState.personPeriod = period;
+  appState.personExpandedKey = '';
+  appState.personProjectDetailExpandedKey = '';
+  appState.projectBusinessUnit = '全部';
+  appState.projectDemandType = '全部';
+  appState.projectDept = '全部';
+  appState.projectClass = '全部';
+  renderApp();
+}
+
+function setPersonBusinessUnit(unit) {
+  appState.personBusinessUnit = unit;
+  appState.personExpandedKey = '';
+  renderApp();
+}
+
+function setPersonDept(dept) {
+  appState.personDept = dept;
+  appState.personExpandedKey = '';
+  renderApp();
+}
+
+function setPersonClass(className) {
+  appState.personClass = className;
+  appState.personExpandedKey = '';
+  renderApp();
+}
+
+function setProjectBusinessUnit(unit) {
+  appState.projectBusinessUnit = unit;
+  appState.projectDemandType = '全部';
+  appState.personProjectDetailExpandedKey = '';
+  renderApp();
+}
+
+function setProjectDemandType(demandType) {
+  appState.projectDemandType = demandType;
+  appState.personProjectDetailExpandedKey = '';
+  renderApp();
+}
+
+function setProjectDept(dept) {
+  appState.projectDept = dept;
+  appState.personProjectDetailExpandedKey = '';
+  renderApp();
+}
+
+function setProjectClass(className) {
+  appState.projectClass = className;
+  appState.personProjectDetailExpandedKey = '';
+  renderApp();
+}
+
+function togglePersonProjectLowDemand() {
+  appState.projectShowLowDemand = !appState.projectShowLowDemand;
+  appState.personProjectDetailExpandedKey = '';
+  renderApp();
+}
+
+function resetPersonTableFilters() {
+  appState.personBusinessUnit = '总计';
+  appState.personDept = '全部';
+  appState.personClass = '全部';
+  appState.personExpandedKey = '';
+  renderApp();
+}
+
+function resetPersonProjectFilters() {
+  appState.projectBusinessUnit = '全部';
+  appState.projectDemandType = '全部';
+  appState.projectDept = '全部';
+  appState.projectClass = '全部';
+  appState.projectShowLowDemand = false;
+  appState.personProjectDetailExpandedKey = '';
+  renderApp();
+}
+
+function togglePersonExpanded(rowKey) {
+  appState.personExpandedKey = appState.personExpandedKey === rowKey ? '' : rowKey;
+  renderApp();
+}
+
+function togglePersonProjectDetail(rowKey) {
+  appState.personProjectDetailExpandedKey = appState.personProjectDetailExpandedKey === rowKey ? '' : rowKey;
+  renderApp();
+}
+
+function togglePersonProject(index) {
+  appState.personProjectExpanded = appState.personProjectExpanded === index ? -1 : index;
+  renderPersonProjectSection();
+}
+
+function formatPersonNumber(value, digits) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
+  return Number(value).toFixed(digits === undefined ? 1 : digits);
+}
+
+function formatPersonPct(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
+  return (Number(value) * 100).toFixed(0) + '%';
+}
+
+function formatPersonEfficiency(value) {
+  return formatPersonNumber(value, 2);
+}
+
+function formatPersonTenure(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
+  return Number(value).toFixed(1) + '年';
+}
+
+function formatPersonDays(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
+  return Number(value).toFixed(0) + '天';
+}
+
+const PERSON_TEAM_LEADERS = new Set(['陈芳', '张哲', '张玲', '黎江江', '邓卓睿', '王帅']);
+
+function formatPersonDisplayName(person) {
+  const name = person || '';
+  return name + (PERSON_TEAM_LEADERS.has(name) ? '（组长）' : '');
+}
+
+function getPersonPeriods() {
+  const periods = PERSON_EFFICIENCY_DATA.periods || [];
+  return periods.length ? periods : ['总体'];
+}
+
+function getPersonRows(period, unit, dept) {
+  return (PERSON_EFFICIENCY_DATA.rows || []).filter(row =>
+    row.period === period &&
+    (!unit || row.businessUnit === unit) &&
+    (!dept || dept === '全部' || row.dept === dept)
+  );
+}
+
+function getPersonMainRows() {
+  return getPersonRows(appState.personPeriod, appState.personBusinessUnit, appState.personDept)
+    .filter(row => appState.personClass === '全部' || row.className === appState.personClass)
+    .slice()
+    .sort((a, b) => {
+      const aBucket = a.isResigned ? 2 : (PERSON_TEAM_LEADERS.has(a.person) ? 1 : 0);
+      const bBucket = b.isResigned ? 2 : (PERSON_TEAM_LEADERS.has(b.person) ? 1 : 0);
+      if (aBucket !== bBucket) return aBucket - bBucket;
+      return (b.efficiency || -999) - (a.efficiency || -999);
+    });
+}
+
+function getPersonRowKey(row) {
+  return [row.period, row.dept, row.person, row.businessUnit].map(encodeURIComponent).join('|');
+}
+
+function getPersonProjectDetailKey(row) {
+  return [row.period, row.businessUnit, row.demandDept, row.product, row.demandType].map(encodeURIComponent).join('|');
+}
+
+function isSamePersonProjectDetail(row, target) {
+  return row &&
+    row.period === target.period &&
+    row.businessUnit === target.businessUnit &&
+    row.demandDept === target.demandDept &&
+    row.product === target.product &&
+    row.demandType === target.demandType;
+}
+
+function getPersonClassTone(className) {
+  if (className === '高效率') return 'high';
+  if (className === '正常') return 'normal';
+  if (className === '待提升') return 'watch';
+  return 'muted';
+}
+
+function classifyPersonEfficiency(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '无标准';
+  const numeric = Number(value);
+  if (numeric >= 1.2) return '高效率';
+  if (numeric >= 1.0) return '正常';
+  return '待提升';
+}
+
+function buildPersonClassBadge(className) {
+  return '<span class="person-class-badge tone-' + getPersonClassTone(className) + '">' + escapeHtml(className || '-') + '</span>';
+}
+
+function getPersonEfficiencyTone(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return 'muted';
+  const numeric = Number(value);
+  if (numeric >= 1.2) return 'high';
+  if (numeric >= 1.0) return 'normal';
+  return 'watch';
+}
+
+function buildPersonEfficiencyValue(value) {
+  return '<span class="person-efficiency-value tone-' + getPersonEfficiencyTone(value) + '">' + formatPersonEfficiency(value) + '</span>';
+}
+
+function buildEmployeeStatusBadge(row) {
+  const status = row.employeeStatus || (row.rosterMatched ? '-' : '未匹配');
+  const tone = row.isResigned ? 'resigned' : (row.rosterMatched ? 'active' : 'unknown');
+  return '<span class="person-employee-badge tone-' + tone + '">' + escapeHtml(status) + '</span>';
+}
+
+function getOverviewPersonRows() {
+  return getPersonRows(appState.personPeriod, '总计', '全部');
+}
+
+function hasProjectStandard(row) {
+  return (row.standardWorkload || 0) > 0 && (row.evaluatedOutput || 0) > 0;
+}
+
+function getProjectStandardRows() {
+  return (PERSON_EFFICIENCY_DATA.projectDetails || [])
+    .filter(row => row.period === appState.personPeriod && hasProjectStandard(row));
+}
+
+function getProjectBusinessUnits() {
+  const preferredOrder = ['全部', '图片', '混剪', '实拍'];
+  const values = getProjectStandardRows()
+    .map(row => row.businessUnit)
+    .filter(Boolean);
+  const unique = Array.from(new Set(values));
+  return preferredOrder
+    .filter(unit => unit === '全部' || unique.includes(unit))
+    .concat(unique.filter(unit => !preferredOrder.includes(unit)).sort((a, b) => a.localeCompare(b, 'zh-CN')));
+}
+
+function getEffectiveProjectBusinessUnit() {
+  const businessUnits = getProjectBusinessUnits();
+  return businessUnits.includes(appState.projectBusinessUnit) ? appState.projectBusinessUnit : '全部';
+}
+
+function getProjectDemandTypesForUnit(unit) {
+  const values = getProjectStandardRows()
+    .filter(row => unit === '全部' || row.businessUnit === unit)
+    .map(row => row.demandType)
+    .filter(Boolean);
+  const unique = Array.from(new Set(values));
+  const standardItems = ((PERSON_EFFICIENCY_DATA.standardCards || {})[unit] || [])
+    .map(item => item && item.demandType)
+    .filter(Boolean);
+  const ordered = standardItems.filter(type => unique.includes(type));
+  const remainder = unique
+    .filter(type => !ordered.includes(type))
+    .sort((a, b) => a.localeCompare(b, 'zh-CN'));
+  return ['全部'].concat(ordered, remainder);
+}
+
+function getEffectiveProjectDemandType(demandTypes) {
+  const options = demandTypes || getProjectDemandTypesForUnit(getEffectiveProjectBusinessUnit());
+  return options.includes(appState.projectDemandType) ? appState.projectDemandType : '全部';
+}
+
+function getPersonProjectBaseRows(includeDemandType) {
+  const unit = getEffectiveProjectBusinessUnit();
+  const demandTypes = getProjectDemandTypesForUnit(unit);
+  const demandType = includeDemandType ? getEffectiveProjectDemandType(demandTypes) : '全部';
+  return getProjectStandardRows()
+    .filter(row =>
+      (unit === '全部' || row.businessUnit === unit) &&
+      (demandType === '全部' || row.demandType === demandType)
+    );
+}
+
+function calcPersonWeightedEfficiency(standardWorkload, actualWorkload) {
+  if (!actualWorkload || Number.isNaN(Number(actualWorkload))) return null;
+  return Number(standardWorkload || 0) / Number(actualWorkload);
+}
+
+function getPersonAnalysisRows() {
+  return getPersonRows(appState.personPeriod, '总计', '全部')
+    .filter(row => row.eligible !== false && row.efficiency !== null && row.efficiency !== undefined);
+}
+
+function addPersonAnalysisMetric(target, row) {
+  target.standardWorkload += row.standardWorkload || 0;
+  target.evaluatedWorkload += row.evaluatedWorkload || 0;
+  target.evaluatedOutput += row.evaluatedOutput || 0;
+}
+
+function finalizePersonAnalysisMetric(row) {
+  row.efficiency = calcPersonWeightedEfficiency(row.standardWorkload, row.evaluatedWorkload);
+  return row;
+}
+
+function getPersonAnalysisMonthlyEfficiency(rows, months) {
+  const result = {};
+  months.forEach(month => {
+    let numerator = 0;
+    let denominator = 0;
+    rows.forEach(row => {
+      const value = (row.monthlyEfficiency || {})[month];
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return;
+      const weight = row.evaluatedOutput || 1;
+      numerator += Number(value) * weight;
+      denominator += weight;
+    });
+    result[month] = denominator ? numerator / denominator : null;
+  });
+  return result;
+}
+
+function buildPersonActionTypeItems() {
+  const months = PERSON_EFFICIENCY_DATA.months || ['2026-03', '2026-04', '2026-05'];
+  const groupMap = {};
+  getProjectStandardRows().forEach(row => {
+    const key = [row.dept || '-', row.businessUnit || '-', row.demandType || '-'].join('|');
+    if (!groupMap[key]) {
+      groupMap[key] = {
+        dept: row.dept || '-',
+        businessUnit: row.businessUnit || '-',
+        demandType: row.demandType || '-',
+        standardWorkload: 0,
+        evaluatedWorkload: 0,
+        evaluatedOutput: 0,
+        rows: [],
+      };
+    }
+    addPersonAnalysisMetric(groupMap[key], row);
+    groupMap[key].rows.push(row);
+  });
+  const groups = Object.values(groupMap).map(row => {
+    finalizePersonAnalysisMetric(row);
+    row.monthlyEfficiency = getPersonAnalysisMonthlyEfficiency(row.rows, months);
+    row.lowMonths = months.filter(month => {
+      const value = row.monthlyEfficiency[month];
+      return value !== null && value !== undefined && value < 1;
+    }).length;
+    row.allMonthsLow = months.every(month => {
+      const value = row.monthlyEfficiency[month];
+      return value !== null && value !== undefined && value < 1;
+    });
+    return row;
+  });
+  const byType = {};
+  groups.forEach(row => {
+    const key = [row.businessUnit, row.demandType].join('|');
+    if (!byType[key]) byType[key] = [];
+    byType[key].push(row);
+  });
+  Object.keys(byType).forEach(key => {
+    byType[key]
+      .sort((a, b) => (a.efficiency || 999) - (b.efficiency || 999))
+      .forEach((row, idx) => { row.typeRank = idx + 1; row.typeDeptCount = byType[key].length; });
+  });
+  return groups
+    .filter(row =>
+      row.efficiency !== null &&
+      row.efficiency < 1 &&
+      row.allMonthsLow &&
+      row.evaluatedOutput >= 50 &&
+      row.typeDeptCount >= 2 &&
+      row.typeRank <= 2
+    )
+    .sort((a, b) => {
+      if (a.typeRank !== b.typeRank) return a.typeRank - b.typeRank;
+      const outputDiff = (b.evaluatedOutput || 0) - (a.evaluatedOutput || 0);
+      if (outputDiff !== 0) return outputDiff;
+      return (a.efficiency || 999) - (b.efficiency || 999);
+    })
+    .slice(0, 6)
+    .map(row => ({
+      dept: row.dept,
+      title: row.businessUnit + ' / ' + row.demandType,
+      reason: '3个月均低于标准，同类型制作部门倒数第 ' + row.typeRank + '。',
+      meta: '评估效率 ' + formatPersonEfficiency(row.efficiency),
+    }));
+}
+
+function getProjectActionGroupKey(row, includeDemandType) {
+  const parts = [row.demandDept || '-', row.product || '-'];
+  if (includeDemandType) parts.push(row.demandType || '-');
+  return parts.join('|');
+}
+
+function buildProjectActionGroups(includeDemandType) {
+  const groupMap = {};
+  getProjectStandardRows().forEach(row => {
+    const projectKey = getProjectActionGroupKey(row, includeDemandType);
+    const deptKey = projectKey + '|' + (row.dept || '-');
+    if (!groupMap[projectKey]) {
+      groupMap[projectKey] = {
+        projectKey: projectKey,
+        demandDept: row.demandDept || '-',
+        product: row.product || '-',
+        demandType: includeDemandType ? (row.demandType || '-') : '',
+        deptRows: {},
+      };
+    }
+    if (!groupMap[projectKey].deptRows[deptKey]) {
+      groupMap[projectKey].deptRows[deptKey] = {
+        dept: row.dept || '-',
+        standardWorkload: 0,
+        evaluatedWorkload: 0,
+        evaluatedOutput: 0,
+      };
+    }
+    addPersonAnalysisMetric(groupMap[projectKey].deptRows[deptKey], row);
+  });
+  return Object.values(groupMap).map(group => {
+    group.depts = Object.values(group.deptRows).map(finalizePersonAnalysisMetric);
+    return group;
+  });
+}
+
+function getProjectActionCandidatesFromGroups(groups, level) {
+  const candidates = [];
+  groups.forEach(group => {
+    if (group.depts.length < 2) return;
+    group.depts.forEach(row => {
+      if (!row.evaluatedOutput || row.evaluatedOutput < 20 || row.efficiency === null || row.efficiency >= 1) return;
+      const others = group.depts.filter(item => item.dept !== row.dept);
+      const otherStandard = others.reduce((sum, item) => sum + (item.standardWorkload || 0), 0);
+      const otherActual = others.reduce((sum, item) => sum + (item.evaluatedWorkload || 0), 0);
+      const otherEfficiency = calcPersonWeightedEfficiency(otherStandard, otherActual);
+      const gap = otherEfficiency === null ? 0 : otherEfficiency - row.efficiency;
+      if (otherEfficiency === null || gap < 0.1) return;
+      candidates.push({
+        dept: row.dept,
+        level: level,
+        demandDept: group.demandDept,
+        product: group.product,
+        demandType: group.demandType,
+        efficiency: row.efficiency,
+        otherEfficiency: otherEfficiency,
+        gap: gap,
+        evaluatedOutput: row.evaluatedOutput,
+        projectKey: group.projectKey,
+      });
+    });
+  });
+  return candidates;
+}
+
+function buildPersonActionProjectItems() {
+  const productGroups = buildProjectActionGroups(false);
+  const typeGroups = buildProjectActionGroups(true);
+  const typeCandidates = getProjectActionCandidatesFromGroups(typeGroups, '类型级');
+  const productTypeMap = {};
+  typeCandidates.forEach(item => {
+    const key = [item.demandDept, item.product, item.dept].join('|');
+    if (!productTypeMap[key]) productTypeMap[key] = [];
+    productTypeMap[key].push(item);
+  });
+  const productCandidates = getProjectActionCandidatesFromGroups(productGroups, '产品级');
+  const finalItems = [];
+  productCandidates.forEach(item => {
+    const key = [item.demandDept, item.product, item.dept].join('|');
+    const typeItems = productTypeMap[key] || [];
+    if (typeItems.length >= 2) {
+      finalItems.push(Object.assign({}, item, {reasonTag: '整体落后'}));
+    } else {
+      typeItems.forEach(typeItem => finalItems.push(Object.assign({}, typeItem, {reasonTag: '类型落后'})));
+    }
+  });
+  typeCandidates.forEach(item => {
+    const key = [item.demandDept, item.product, item.dept].join('|');
+    if (!productCandidates.some(candidate => [candidate.demandDept, candidate.product, candidate.dept].join('|') === key)) {
+      finalItems.push(Object.assign({}, item, {reasonTag: '类型落后'}));
+    }
+  });
+  const seen = new Set();
+  return finalItems
+    .filter(item => {
+      const key = [item.dept, item.level, item.demandDept, item.product, item.demandType || ''].join('|');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => {
+      const gapDiff = (b.gap || 0) - (a.gap || 0);
+      if (gapDiff !== 0) return gapDiff;
+      return (b.evaluatedOutput || 0) - (a.evaluatedOutput || 0);
+    })
+    .slice(0, 6)
+    .map(item => {
+      const title = item.level === '产品级'
+        ? item.demandDept + ' / ' + item.product
+        : item.demandDept + ' / ' + item.product + ' / ' + item.demandType;
+      return {
+        dept: item.dept,
+        title: title,
+        reason: item.reasonTag + '，低于其他制作部门 ' + formatPersonNumber(item.gap, 2) + '。',
+        meta: '本部门 ' + formatPersonEfficiency(item.efficiency) + ' / 其他部门 ' + formatPersonEfficiency(item.otherEfficiency),
+      };
+    });
+}
+
+function buildPersonActionListHtml(items, emptyText) {
+  if (!items.length) return '<div class="person-action-empty">' + escapeHtml(emptyText) + '</div>';
+  return '<div class="person-action-list">' + items.map((item, idx) =>
+    '<div class="person-action-item">' +
+      '<div class="person-action-rank">' + (idx + 1) + '</div>' +
+      '<div class="person-action-content">' +
+        '<div class="person-action-title"><b>' + escapeHtml(item.dept) + '</b><span>' + escapeHtml(item.title) + '</span><em>' + escapeHtml(item.meta) + '</em></div>' +
+        '<div class="person-action-reason">' + escapeHtml(item.reason) + '</div>' +
+      '</div>' +
+    '</div>'
+  ).join('') + '</div>';
+}
+
+function buildPersonAnalysisHtml() {
+  const typeItems = buildPersonActionTypeItems();
+  const projectItems = buildPersonActionProjectItems();
+  return '<section class="person-panel person-analysis-panel">' +
+    '<div class="person-section-head"><div><div class="person-section-title">重点关注</div><div class="person-section-hint">基于当前统计范围，定位制作部门需要优先复盘的需求类型和项目</div></div></div>' +
+    '<div class="person-action-grid">' +
+      '<div class="person-action-block">' +
+        '<div class="person-analysis-block-title">需求类型提升点</div>' +
+        buildPersonActionListHtml(typeItems, '暂无满足“3个月均低效且同类型倒数前2”的需求类型。') +
+      '</div>' +
+      '<div class="person-action-block">' +
+        '<div class="person-analysis-block-title">项目提升点</div>' +
+        buildPersonActionListHtml(projectItems, '暂无满足“待提升且落后其他制作部门”的项目。') +
+      '</div>' +
+    '</div>' +
+  '</section>';
+}
+
+function getPersonProjectGroups(includeDemandType) {
+  const groupMap = {};
+  getPersonProjectBaseRows(includeDemandType !== false).forEach(row => {
+    const key = getPersonProjectDetailKey(row);
+    if (!groupMap[key]) {
+      groupMap[key] = {
+        key: key,
+        period: row.period,
+        businessUnit: row.businessUnit,
+        demandDept: row.demandDept,
+        product: row.product,
+        demandType: row.demandType,
+        totalEvaluatedOutput: 0,
+        rows: [],
+      };
+    }
+    groupMap[key].totalEvaluatedOutput += row.evaluatedOutput || 0;
+    groupMap[key].rows.push(row);
+  });
+  return Object.values(groupMap)
+    .filter(group => appState.projectShowLowDemand || group.totalEvaluatedOutput >= 100)
+    .map(group => {
+      group.rows = group.rows.slice().sort((a, b) => {
+        const outputDiff = (b.evaluatedOutput || 0) - (a.evaluatedOutput || 0);
+        if (outputDiff !== 0) return outputDiff;
+        return (b.efficiency || -999) - (a.efficiency || -999);
+      });
+      group.matchingRows = group.rows.filter(row => isProjectRowHighlighted(row));
+      return group;
+    })
+    .filter(group => group.matchingRows.length > 0)
+    .sort((a, b) => {
+      const outputDiff = (b.totalEvaluatedOutput || 0) - (a.totalEvaluatedOutput || 0);
+      if (outputDiff !== 0) return outputDiff;
+      const aEfficiency = Math.max.apply(null, a.rows.map(row => row.efficiency || -999));
+      const bEfficiency = Math.max.apply(null, b.rows.map(row => row.efficiency || -999));
+      return bEfficiency - aEfficiency;
+    });
+}
+
+function isProjectRowHighlighted(row) {
+  const dept = getEffectiveProjectDept();
+  const classNameFilter = getEffectiveProjectClass();
+  const deptMatch = dept === '全部' || row.dept === dept;
+  const className = classifyPersonEfficiency(row.efficiency);
+  const classMatch = classNameFilter === '全部' || className === classNameFilter;
+  return deptMatch && classMatch;
+}
+
+function getPersonProjectDemandTypes() {
+  return getProjectDemandTypesForUnit(getEffectiveProjectBusinessUnit());
+}
+
+function getProjectDepartments() {
+  const values = getPersonProjectBaseRows(true)
+    .map(row => row.dept)
+    .filter(Boolean);
+  return ['全部'].concat(Array.from(new Set(values)).sort((a, b) => a.localeCompare(b, 'zh-CN')));
+}
+
+function getEffectiveProjectDept(depts) {
+  const options = depts || getProjectDepartments();
+  return options.includes(appState.projectDept) ? appState.projectDept : '全部';
+}
+
+function getEffectiveProjectClass(classes) {
+  const options = classes || ['全部'].concat(PERSON_EFFICIENCY_DATA.classNames || ['高效率', '正常', '待提升']);
+  return options.includes(appState.projectClass) ? appState.projectClass : '全部';
+}
+
+function hasProjectSoftFilters() {
+  return getEffectiveProjectDept() !== '全部' || getEffectiveProjectClass() !== '全部';
+}
+
+function buildFilterSummaryHtml(items, resetActionName) {
+  const activeItems = items.filter(item => item && item.value);
+  const body = activeItems.length
+    ? activeItems.map(item =>
+        '<span class="person-filter-summary-tag"><b>' + escapeHtml(item.label) + '</b>' + escapeHtml(item.value) + '</span>'
+      ).join('')
+    : '<span class="person-filter-summary-empty">无</span>';
+  const resetButton = resetActionName
+    ? '<button class="person-filter-summary-reset' + (activeItems.length ? ' active' : '') + '" type="button" onclick="' + resetActionName + '()">清空</button>'
+    : '';
+  return '<div class="person-filter-summary">' +
+    '<span class="person-filter-summary-label">当前筛选</span>' +
+    '<div class="person-filter-summary-tags">' + body + '</div>' +
+    resetButton +
+  '</div>';
+}
+
+function buildPersonProjectControlsHtml() {
+  const businessUnits = getProjectBusinessUnits();
+  const demandTypes = getPersonProjectDemandTypes();
+  const depts = getProjectDepartments();
+  const classes = ['全部'].concat(PERSON_EFFICIENCY_DATA.classNames || ['高效率', '正常', '待提升']);
+  const activeUnit = getEffectiveProjectBusinessUnit();
+  const activeDemandType = getEffectiveProjectDemandType(demandTypes);
+  const activeDept = getEffectiveProjectDept(depts);
+  const activeClass = getEffectiveProjectClass(classes);
+  const typeGroupFiltered = activeUnit !== '全部' || activeDemandType !== '全部';
+  const deptFiltered = activeDept !== '全部';
+  const classFiltered = activeClass !== '全部';
+  const rangeFiltered = appState.projectShowLowDemand;
+  const demandTypeSelect = activeUnit === '全部' ? '' :
+    '<label class="person-select-label person-demand-type-label' + (activeDemandType !== '全部' ? ' is-filtered' : '') + '">细分类型 ' +
+      '<select class="person-select' + (activeDemandType !== '全部' ? ' is-filtered' : '') + '" onchange="setProjectDemandType(this.value)">' +
+        demandTypes.map(type => '<option value="' + escapeHtmlAttr(type) + '"' + (activeDemandType === type ? ' selected' : '') + '>' + escapeHtml(type) + '</option>').join('') +
+      '</select>' +
+    '</label>';
+  const summaryHtml = buildFilterSummaryHtml([
+    {label: '素材类型：', value: activeUnit !== '全部' ? activeUnit : ''},
+    {label: '细分类型：', value: activeUnit !== '全部' && activeDemandType !== '全部' ? activeDemandType : ''},
+    {label: '制作部门：', value: activeDept !== '全部' ? activeDept : ''},
+    {label: '效率分类：', value: activeClass !== '全部' ? activeClass : ''},
+    {label: '项目范围：', value: appState.projectShowLowDemand ? '包含低需求项目' : ''},
+  ], 'resetPersonProjectFilters');
+  return '<div class="person-filter-bar">' +
+    '<div class="person-filter-group' + (deptFiltered ? ' is-filtered' : '') + '"><label class="person-select-label' + (deptFiltered ? ' is-filtered' : '') + '">制作部门 ' +
+      '<select class="person-select' + (deptFiltered ? ' is-filtered' : '') + '" onchange="setProjectDept(this.value)">' +
+        depts.map(dept => '<option value="' + escapeHtmlAttr(dept) + '"' + (activeDept === dept ? ' selected' : '') + '>' + escapeHtml(dept) + '</option>').join('') +
+      '</select>' +
+    '</label></div>' +
+    '<div class="person-filter-group person-project-type-filter' + (typeGroupFiltered ? ' is-filtered' : '') + '"><span class="person-filter-title">素材类型</span><div class="person-filter-type-stack">' +
+      '<div class="person-filter-chips person-filter-secondary">' +
+        businessUnits.map(unit =>
+          '<button class="period-chip-btn' + (activeUnit === unit ? ' active' : '') + '" type="button" onclick="setProjectBusinessUnit(\'' + escapeHtmlAttr(unit) + '\')">' + escapeHtml(unit) + '</button>'
+        ).join('') +
+      '</div>' +
+      demandTypeSelect +
+    '</div></div>' +
+    '<div class="person-filter-group' + (classFiltered ? ' is-filtered' : '') + '"><span class="person-filter-title">效率分类</span><div class="person-filter-chips">' +
+      classes.map(className =>
+        '<button class="period-chip-btn' + (activeClass === className ? ' active' : '') + '" type="button" onclick="setProjectClass(\'' + escapeHtmlAttr(className) + '\')">' + escapeHtml(className) + '</button>'
+      ).join('') +
+    '</div></div>' +
+    '<div class="person-filter-group' + (rangeFiltered ? ' is-filtered' : '') + '"><span class="person-filter-title">项目范围</span><div class="person-filter-chips">' +
+      '<button class="period-chip-btn' + (appState.projectShowLowDemand ? ' active' : '') + '" type="button" title="显示产出数<100的项目" aria-label="显示产出数小于100的项目" onclick="togglePersonProjectLowDemand()">显示低需求项目</button>' +
+    '</div></div>' +
+  '</div>' + summaryHtml;
+}
+
+function buildPersonLogicListHtml(value) {
+  const values = Array.isArray(value) ? value : [value || ''];
+  return '<ol class="person-logic-list">' + values.map(item => {
+    if (item && typeof item === 'object') {
+      const children = Array.isArray(item.children) ? item.children : [];
+      const text = item.text || '';
+      const highlightHtml = item.highlight
+        ? '<span class="person-logic-highlight">' + escapeHtml(item.highlight) + '</span>'
+        : '';
+      const childrenHtml = children.length
+        ? '<div class="person-logic-subtitle">' + escapeHtml(item.childrenTitle || '') + '</div>' +
+          '<ul class="person-logic-sublist">' + children.map(child => '<li>' + escapeHtml(child) + '</li>').join('') + '</ul>'
+        : '';
+      return '<li><span class="person-logic-term">' + escapeHtml(item.title || '') + '</span>' +
+        (text ? '：' : '') + escapeHtml(text) + highlightHtml + childrenHtml + '</li>';
+    }
+    return '<li>' + escapeHtml(item) + '</li>';
+  }).join('') + '</ol>';
+}
+
+function buildPersonLogicHtml() {
+  const readme = PERSON_EFFICIENCY_DATA.readme || {};
+  const standardCards = PERSON_EFFICIENCY_DATA.standardCards || {};
+  const standardGroups = [
+    {title: '图片', items: standardCards['图片'] || []},
+    {title: '剪辑', items: (standardCards['混剪'] || []).concat(standardCards['实拍'] || [])},
+  ].filter(group => group.items.length);
+  const fallbackStandards = Array.isArray(standardCards) ? standardCards : [];
+  return '<section class="person-logic person-logic-redesign">' +
+    '<div class="person-logic-head">' +
+      '<div class="person-logic-heading">指标说明</div>' +
+    '</div>' +
+    '<div class="person-logic-body">' +
+      '<div class="person-logic-grid">' +
+        '<div class="person-logic-item person-logic-item-primary">' +
+          buildPersonLogicListHtml(readme.metric || []) +
+        '</div>' +
+        '<div class="person-logic-item person-logic-item-standards">' +
+          '<div class="person-standard-card-grid">' +
+            (standardGroups.length ? standardGroups.map(group =>
+              '<div class="person-standard-card">' +
+                '<div class="person-standard-card-title">' + escapeHtml(group.title) + '</div>' +
+                '<div class="person-standard-list">' +
+                  group.items.map(item =>
+                    '<div class="person-standard-row"><span>' + escapeHtml(item.demandType) + '</span><b class="num">' + formatPersonNumber(item.standardMinutes, 1) + '分钟</b></div>'
+                  ).join('') +
+                '</div>' +
+              '</div>'
+            ).join('') :
+              '<div class="person-standard-card">' +
+                '<div class="person-standard-list">' +
+                  fallbackStandards.map(item =>
+                    '<div class="person-standard-row"><span>' + escapeHtml(item.demandType) + '</span><b class="num">' + formatPersonNumber(item.standardMinutes, 1) + '分钟</b></div>'
+                  ).join('') +
+                '</div>' +
+              '</div>'
+            ) +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+  '</section>';
+}
+
+function buildPersonKpiCardsHtml() {
+  const rows = getOverviewPersonRows();
+  const eligibleRows = rows.filter(row => row.eligible);
+  const total = rows.length;
+  const eligible = eligibleRows.length;
+  const classCounts = {'高效率': 0, '正常': 0, '待提升': 0};
+  eligibleRows.forEach(row => {
+    if (classCounts[row.className] !== undefined) classCounts[row.className] += 1;
+  });
+  const cards = [
+    {label: '总人数', value: total, ratio: total ? '100%' : '-', showRatio: false},
+    {label: '纳入分析人数', value: eligible, ratio: total ? formatPersonPct(eligible / total) : '-', showRatio: false},
+    {label: '高效率', value: classCounts['高效率'], ratio: eligible ? formatPersonPct(classCounts['高效率'] / eligible) : '-'},
+    {label: '正常', value: classCounts['正常'], ratio: eligible ? formatPersonPct(classCounts['正常'] / eligible) : '-'},
+    {label: '待提升', value: classCounts['待提升'], ratio: eligible ? formatPersonPct(classCounts['待提升'] / eligible) : '-'},
+  ];
+  return '<div class="person-kpi-grid">' + cards.map(card =>
+    '<div class="person-kpi-card">' +
+      '<div class="person-kpi-label">' + card.label + '</div>' +
+      '<div class="person-kpi-value num">' + card.value + '</div>' +
+      (card.showRatio === false ? '' : '<div class="person-kpi-ratio">占比 ' + card.ratio + '</div>') +
+    '</div>'
+  ).join('') + '</div>';
+}
+
+function getPersonDepartmentSummaryRows() {
+  return (PERSON_EFFICIENCY_DATA.departmentSummary || [])
+    .slice()
+    .sort((a, b) => {
+      const ae = a.efficiency === null || a.efficiency === undefined ? -999 : a.efficiency;
+      const be = b.efficiency === null || b.efficiency === undefined ? -999 : b.efficiency;
+      if (be !== ae) return be - ae;
+      return (b.eligibleCount || 0) - (a.eligibleCount || 0);
+    });
+}
+
+function buildDepartmentCountPill(value, tone) {
+  return '<span class="person-count-pill tone-' + tone + '">' + escapeHtml(String(value || 0)) + '</span>';
+}
+
+function buildPersonDepartmentSummaryHtml() {
+  const rows = getPersonDepartmentSummaryRows();
+  if (!rows.length) return '<section class="person-panel"><div class="person-section-title">数据概览</div><div class="person-empty">当前暂无可展示的分部门情况。</div></section>';
+  const legendItems = [
+    {key: 'highCount', label: '高效率', tone: 'high'},
+    {key: 'normalCount', label: '正常', tone: 'normal'},
+    {key: 'watchCount', label: '待提升', tone: 'watch'},
+  ];
+  return '<section class="person-panel person-department-summary-panel">' +
+    '<div class="person-section-head"><div><div class="person-section-title">数据概览</div></div></div>' +
+    '<div class="person-overview-kpi-wrap">' + buildPersonKpiCardsHtml() + '</div>' +
+    '<div class="person-dept-grid person-dept-grid-summary">' +
+      rows.map((row, idx) => {
+        const total = row.eligibleCount || 0;
+        return '<div class="person-dept-card person-dept-card-summary">' +
+          '<div class="person-dept-summary-top">' +
+            '<div class="person-dept-summary-meta">' +
+              '<div class="person-dept-name">' + escapeHtml(row.dept || '-') + '</div>' +
+            '</div>' +
+            '<div class="person-dept-summary-efficiency">' +
+              '<span class="person-dept-summary-efficiency-label">评估效率</span>' +
+              '<span class="person-dept-summary-efficiency-value num">' + formatPersonEfficiency(row.efficiency) + '</span>' +
+            '</div>' +
+          '</div>' +
+          '<div class="person-dept-summary-breakdown">' +
+            '<div class="person-dept-breakdown-title"><span>效率分类</span><em>人数占比</em></div>' +
+            '<div class="person-pie-wrap person-pie-wrap-summary"><canvas id="personDeptSummaryPie_' + idx + '"></canvas><div class="person-pie-center"><span>' + escapeHtml(String(total)) + '</span><em>人</em></div></div>' +
+            '<div class="person-dept-legend">' +
+              legendItems.map(item => {
+                const count = row[item.key] || 0;
+                const ratio = total ? formatPersonPct(count / total) : '-';
+                return '<div class="person-dept-legend-row">' +
+                  '<span class="person-dept-legend-name"><i class="person-dept-legend-dot tone-' + item.tone + '"></i>' + item.label + '</span>' +
+                  '<span class="person-dept-legend-metric"><b>' + escapeHtml(String(count)) + '人</b><em>' + escapeHtml(ratio) + '</em></span>' +
+                '</div>';
+              }).join('') +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('') +
+    '</div>' +
+  '</section>';
+}
+
+function getDepartmentPersonGroups() {
+  const rows = getOverviewPersonRows().filter(row => row.eligible);
+  const groups = {};
+  rows.forEach(row => {
+    if (!groups[row.dept]) {
+      groups[row.dept] = {dept: row.dept, counts: {'高效率': 0, '正常': 0, '待提升': 0}, high: [], watch: []};
+    }
+    if (groups[row.dept].counts[row.className] !== undefined) groups[row.dept].counts[row.className] += 1;
+    if (row.className === '高效率') groups[row.dept].high.push(row);
+    if (row.className === '待提升') groups[row.dept].watch.push(row);
+  });
+  return Object.values(groups).sort((a, b) => a.dept.localeCompare(b.dept, 'zh-CN'));
+}
+
+function buildDeptPersonList(title, rows, className) {
+  const sorted = rows.slice().sort((a, b) => className === 'watch'
+    ? (a.efficiency || 999) - (b.efficiency || 999)
+    : (b.efficiency || -999) - (a.efficiency || -999));
+  if (!sorted.length) return '<div class="person-dept-list"><span class="person-dept-list-title">' + title + '</span><span class="person-empty-inline">暂无</span></div>';
+  return '<div class="person-dept-list">' +
+    '<span class="person-dept-list-title">' + title + '</span>' +
+    sorted.map(row =>
+      '<span class="person-mini-pill">' + escapeHtml(formatPersonDisplayName(row.person)) + ' <b>' + formatPersonEfficiency(row.efficiency) + '</b></span>'
+    ).join('') +
+  '</div>';
+}
+
+function buildPersonDepartmentDistributionHtml() {
+  const groups = getDepartmentPersonGroups();
+  if (!groups.length) return '<section class="person-panel"><div class="person-empty">当前统计范围暂无可展示的部门分类分布。</div></section>';
+  return '<section class="person-panel">' +
+    '<div class="person-section-head"><div><div class="person-section-title">部门分类分布</div><div class="person-section-subtitle">饼图仅受统计范围影响，下方列出各部门高效率和待提升人员。</div></div></div>' +
+    '<div class="person-dept-grid">' +
+      groups.map((group, idx) =>
+        '<div class="person-dept-card">' +
+          '<div class="person-dept-card-head">' +
+            '<div class="person-dept-name">' + escapeHtml(group.dept) + '</div>' +
+            '<div class="person-dept-total">纳入 ' + Object.values(group.counts).reduce((a, b) => a + b, 0) + ' 人</div>' +
+          '</div>' +
+          '<div class="person-pie-wrap"><canvas id="personDeptPie_' + idx + '"></canvas></div>' +
+          buildDeptPersonList('高效率', group.high, 'high') +
+          buildDeptPersonList('待提升', group.watch, 'watch') +
+        '</div>'
+      ).join('') +
+    '</div>' +
+  '</section>';
+}
+
+function renderPersonDepartmentCharts() {
+  const groups = getPersonDepartmentSummaryRows().map(row => ({
+    counts: {
+      '高效率': row.highCount || 0,
+      '正常': row.normalCount || 0,
+      '待提升': row.watchCount || 0,
+    }
+  }));
+  const labels = ['高效率', '正常', '待提升'];
+  const colors = ['#6BAFA8', '#7E99C8', '#B98A55'];
+  groups.forEach((group, idx) => {
+    const canvas = document.getElementById('personDeptSummaryPie_' + idx);
+    if (!canvas) return;
+    const chartId = 'personDeptSummaryPie_' + appState.personPeriod + '_' + idx;
+    const data = labels.map(label => group.counts[label] || 0);
+    standaloneCharts[chartId] = new Chart(canvas.getContext('2d'), {
+      type: 'doughnut',
+      data: {labels, datasets: [{data, backgroundColor: colors, borderColor: '#fff', borderWidth: 2}]},
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: '64%',
+        plugins: {
+          legend: {display: false},
+          datalabels: {display: false}
+        }
+      }
+    });
+  });
+}
+
+function buildPersonTableControlsHtml() {
+  const units = PERSON_EFFICIENCY_DATA.businessUnits || ['总计', '图片', '混剪'];
+  const depts = ['全部'].concat(PERSON_EFFICIENCY_DATA.departments || []);
+  const classes = ['全部'].concat(PERSON_EFFICIENCY_DATA.classNames || ['高效率', '正常', '待提升']);
+  const unitFiltered = appState.personBusinessUnit !== '总计';
+  const classFiltered = appState.personClass !== '全部';
+  const deptFiltered = appState.personDept !== '全部';
+  const summaryHtml = buildFilterSummaryHtml([
+    {label: '素材类型：', value: appState.personBusinessUnit !== '总计' ? appState.personBusinessUnit : ''},
+    {label: '效率分类：', value: appState.personClass !== '全部' ? appState.personClass : ''},
+    {label: '制作部门：', value: appState.personDept !== '全部' ? appState.personDept : ''},
+  ], 'resetPersonTableFilters');
+  return '<div class="person-filter-bar">' +
+    '<div class="person-filter-group' + (deptFiltered ? ' is-filtered' : '') + '"><label class="person-select-label' + (deptFiltered ? ' is-filtered' : '') + '">制作部门 ' +
+      '<select class="person-select' + (deptFiltered ? ' is-filtered' : '') + '" onchange="setPersonDept(this.value)">' +
+        depts.map(dept => '<option value="' + escapeHtmlAttr(dept) + '"' + (appState.personDept === dept ? ' selected' : '') + '>' + escapeHtml(dept) + '</option>').join('') +
+      '</select>' +
+    '</label></div>' +
+    '<div class="person-filter-group' + (unitFiltered ? ' is-filtered' : '') + '"><span class="person-filter-title">素材类型</span><div class="person-filter-chips">' +
+      units.map(unit =>
+        '<button class="period-chip-btn' + (appState.personBusinessUnit === unit ? ' active' : '') + '" type="button" onclick="setPersonBusinessUnit(\'' + escapeHtmlAttr(unit) + '\')">' + escapeHtml(unit) + '</button>'
+      ).join('') +
+    '</div></div>' +
+    '<div class="person-filter-group' + (classFiltered ? ' is-filtered' : '') + '"><span class="person-filter-title">效率分类</span><div class="person-filter-chips">' +
+      classes.map(className =>
+        '<button class="period-chip-btn' + (appState.personClass === className ? ' active' : '') + '" type="button" onclick="setPersonClass(\'' + escapeHtmlAttr(className) + '\')">' + escapeHtml(className) + '</button>'
+      ).join('') +
+    '</div></div>' +
+  '</div>' + summaryHtml;
+}
+
+function buildPersonDetailRowsHtml(row) {
+  const selectedUnit = appState.personBusinessUnit;
+  const months = PERSON_EFFICIENCY_DATA.months || ['2026-03', '2026-04', '2026-05'];
+  const monthHeaders = months.map(month => '<th>' + escapeHtml(month) + '</th>').join('');
+  let details = (PERSON_EFFICIENCY_DATA.details || []).filter(item =>
+    item.period === row.period &&
+    item.dept === row.dept &&
+    item.person === row.person &&
+    (selectedUnit === '总计' || item.businessUnit === selectedUnit)
+  );
+  details = details.sort((a, b) => {
+    const outputDiff = (b.evaluatedOutput || 0) - (a.evaluatedOutput || 0);
+    if (outputDiff !== 0) return outputDiff;
+    return (b.efficiency || -999) - (a.efficiency || -999);
+  }).slice(0, 30);
+  if (!details.length) return '<div class="person-empty">暂无可解释明细。</div>';
+  const regularWidth = (100 / (6 + 1.5 + months.length)).toFixed(2);
+  const productWidth = (regularWidth * 1.5).toFixed(2);
+  const colGroup = '<colgroup>' +
+    '<col style="width:' + regularWidth + '%">' +
+    '<col style="width:' + productWidth + '%">' +
+    Array.from({length: 5}).map(() => '<col style="width:' + regularWidth + '%">').join('') +
+    months.map(() => '<col style="width:' + regularWidth + '%">').join('') +
+  '</colgroup>';
+  const tableHead = '<thead>' +
+    '<tr>' +
+      '<th rowspan="2">需求部门</th><th rowspan="2">产品名称</th><th rowspan="2">细分类型</th><th rowspan="2">评估效率</th>' +
+      '<th rowspan="2"><span class="person-th-label">标准耗时</span><span class="person-th-unit">【小时】</span></th>' +
+      '<th rowspan="2"><span class="person-th-label">实际耗时</span><span class="person-th-unit">【小时】</span></th><th rowspan="2">纳入评估产出数</th>' +
+      '<th colspan="' + months.length + '">评估效率</th>' +
+    '</tr>' +
+    '<tr>' + monthHeaders + '</tr>' +
+  '</thead>';
+  return '<div class="person-detail-table-wrap">' +
+    '<div class="person-inline-hint">按【产出数】降序</div>' +
+    '<table class="person-detail-table">' +
+      colGroup +
+      tableHead +
+      '<tbody>' + details.map(item =>
+        '<tr>' +
+          '<td>' + escapeHtml(item.demandDept || '-') + '</td>' +
+          '<td>' + escapeHtml(item.product || '-') + '</td>' +
+          '<td>' + escapeHtml(item.demandType || '-') + '</td>' +
+          '<td class="num">' + buildPersonEfficiencyValue(item.efficiency) + '</td>' +
+          '<td class="num">' + formatPersonNumber(item.standardWorkload, 1) + '</td>' +
+          '<td class="num">' + formatPersonNumber(item.evaluatedWorkload, 1) + '</td>' +
+          '<td class="num">' + formatPersonNumber(item.evaluatedOutput, 0) + '</td>' +
+          months.map(month => '<td class="num">' + buildPersonEfficiencyValue((item.monthlyEfficiency || {})[month]) + '</td>').join('') +
+        '</tr>'
+      ).join('') + '</tbody>' +
+    '</table>' +
+  '</div>';
+}
+
+function buildPersonExpandedHtml(row, colSpan) {
+  const rosterMeta = '入职时间：' + escapeHtml(row.joinDate || '-') +
+    ' · 离职时间：' + escapeHtml(row.leaveDate || '-') +
+    ' · 在职天数：' + escapeHtml(formatPersonDays(row.tenureDays));
+  return '<tr class="person-expanded-row"><td colspan="' + colSpan + '">' +
+    '<div class="person-expanded-panel">' +
+      '<div class="person-expanded-head">' +
+        '<div class="person-expanded-title-block">' +
+          '<div class="person-expanded-title-line">' +
+            '<div class="person-expanded-title">' + escapeHtml(formatPersonDisplayName(row.person)) + ' · 详情</div>' +
+            '<div class="person-expanded-score">' + buildPersonClassBadge(row.className) + buildPersonEfficiencyValue(row.efficiency) + '</div>' +
+          '</div>' +
+        '<div class="person-expanded-subtitle">' + rosterMeta + '</div></div>' +
+      '</div>' +
+      '<div class="person-detail-block">' +
+        '<div class="person-detail-title">任务/项目明细解释</div>' +
+        buildPersonDetailRowsHtml(row) +
+      '</div>' +
+    '</div>' +
+  '</td></tr>';
+}
+
+function buildPersonMainTableHtml() {
+  const rows = getPersonMainRows();
+  const months = PERSON_EFFICIENCY_DATA.months || ['2026-03', '2026-04', '2026-05'];
+  const monthHeaders = months.map(month => '<th>' + escapeHtml(month) + '</th>').join('');
+  const regularColumnCount = 9;
+  const regularColumnWidth = (100 / (regularColumnCount + months.length * 0.72)).toFixed(2);
+  const monthColumnWidth = (regularColumnWidth * 0.72).toFixed(2);
+  const colGroup = '<colgroup>' +
+    Array.from({length: 7}).map(() => '<col style="width:' + regularColumnWidth + '%">').join('') +
+    months.map(() => '<col style="width:' + monthColumnWidth + '%">').join('') +
+    Array.from({length: 2}).map(() => '<col style="width:' + regularColumnWidth + '%">').join('') +
+  '</colgroup>';
+  const tableHead = '<thead>' +
+    '<tr>' +
+      '<th rowspan="2">制作部门</th><th rowspan="2">制作人员</th><th rowspan="2">效率分类</th><th rowspan="2">评估效率</th>' +
+      '<th rowspan="2"><span class="person-th-label">标准耗时</span><span class="person-th-unit">【小时】</span></th>' +
+      '<th rowspan="2"><span class="person-th-label">实际耗时</span><span class="person-th-unit">【小时】</span></th><th rowspan="2">纳入评估产出数</th>' +
+      '<th colspan="' + months.length + '">评估效率</th>' +
+      '<th rowspan="2">员工状态</th><th rowspan="2">在职年数</th>' +
+    '</tr>' +
+    '<tr>' + monthHeaders + '</tr>' +
+  '</thead>';
+  const colSpan = 9 + months.length;
+  const body = rows.length ? rows.map(row => {
+    const key = getPersonRowKey(row);
+    const expanded = appState.personExpandedKey === key;
+    const dimmed = appState.personExpandedKey && !expanded;
+    const basisCells = months.map(month => '<td class="num">' + buildPersonEfficiencyValue((row.monthlyEfficiency || {})[month]) + '</td>').join('');
+    return '<tr class="person-main-row' + (expanded ? ' active' : '') + (dimmed ? ' dimmed' : '') + '">' +
+        '<td>' + escapeHtml(row.dept) + '</td>' +
+        '<td><button class="person-name-btn" type="button" onclick="togglePersonExpanded(\'' + key + '\')">' +
+          '<span class="person-name-text">' + escapeHtml(formatPersonDisplayName(row.person)) + '</span>' +
+          '<span class="person-link-cue" aria-hidden="true">›</span>' +
+        '</button></td>' +
+        '<td>' + buildPersonClassBadge(row.className) + '</td>' +
+        '<td class="num">' + buildPersonEfficiencyValue(row.efficiency) + '</td>' +
+        '<td class="num">' + formatPersonNumber(row.standardWorkload, 1) + '</td>' +
+        '<td class="num">' + formatPersonNumber(row.evaluatedWorkload, 1) + '</td>' +
+        '<td class="num">' + formatPersonNumber(row.evaluatedOutput, 0) + '</td>' +
+        basisCells +
+        '<td>' + buildEmployeeStatusBadge(row) + '</td>' +
+        '<td class="num">' + formatPersonTenure(row.tenureYears) + '</td>' +
+      '</tr>' +
+      (expanded ? buildPersonExpandedHtml(row, colSpan) : '');
+  }).join('') : '<tr><td colspan="' + colSpan + '" class="person-empty-cell">当前筛选下暂无人员数据。</td></tr>';
+
+  return '<section class="person-panel person-table-panel">' +
+    '<div class="person-section-head">' +
+      '<div><div class="person-section-title">人员效率主表</div><div class="person-section-hint">按【评估效率】降序，点击【姓名】查看人员的项目详情</div></div>' +
+    '</div>' +
+    '<div class="person-table-filter-panel">' + buildPersonTableControlsHtml() + '</div>' +
+    '<div class="person-table-scroll">' +
+      '<table class="person-main-table">' +
+        colGroup +
+        tableHead +
+        '<tbody>' + body + '</tbody>' +
+      '</table>' +
+    '</div>' +
+  '</section>';
+}
+
+function getPersonProjectDetailDeptRows(project) {
+  return (PERSON_EFFICIENCY_DATA.projectDetails || [])
+    .filter(row => isSamePersonProjectDetail(row, project))
+    .slice()
+    .sort((a, b) => {
+      const outputDiff = (b.evaluatedOutput || 0) - (a.evaluatedOutput || 0);
+      if (outputDiff !== 0) return outputDiff;
+      return (b.efficiency || -999) - (a.efficiency || -999);
+    });
+}
+
+function getPersonProjectDetailPeopleRows(project) {
+  return (PERSON_EFFICIENCY_DATA.details || [])
+    .filter(row => isSamePersonProjectDetail(row, project))
+    .slice()
+    .sort((a, b) => {
+      const efficiencyDiff = (b.efficiency || -999) - (a.efficiency || -999);
+      if (efficiencyDiff !== 0) return efficiencyDiff;
+      return (b.evaluatedOutput || 0) - (a.evaluatedOutput || 0);
+    });
+}
+
+function buildPersonProjectDetailExpandedHtml(project, colSpan) {
+  const months = PERSON_EFFICIENCY_DATA.months || ['2026-03', '2026-04', '2026-05'];
+  const peopleRows = getPersonProjectDetailPeopleRows(project);
+  const monthHead = months.map(month => '<th>' + escapeHtml(month) + '</th>').join('');
+  const peopleBody = peopleRows.length ? peopleRows.map(row =>
+    '<tr>' +
+      '<td>' + escapeHtml(row.dept || '-') + '</td>' +
+      '<td>' + escapeHtml(row.person || '-') + '</td>' +
+      '<td>' + buildPersonClassBadge(classifyPersonEfficiency(row.efficiency)) + '</td>' +
+      '<td class="num">' + buildPersonEfficiencyValue(row.efficiency) + '</td>' +
+      '<td class="num">' + formatPersonNumber(row.evaluatedWorkload, 1) + '</td>' +
+      '<td class="num">' + formatPersonNumber(row.standardWorkload, 1) + '</td>' +
+      '<td class="num">' + formatPersonNumber(row.evaluatedOutput, 0) + '</td>' +
+      months.map(month => '<td class="num">' + buildPersonEfficiencyValue((row.monthlyEfficiency || {})[month]) + '</td>').join('') +
+    '</tr>'
+  ).join('') : '<tr><td colspan="' + (7 + months.length) + '" class="person-empty-cell">暂无制作人员对比数据。</td></tr>';
+
+  return '<tr class="person-project-detail-expanded-row"><td colspan="' + colSpan + '">' +
+    '<div class="person-project-detail-expanded-panel">' +
+      '<div class="person-project-detail-expanded-head">' +
+        '<div class="person-project-detail-expanded-title">人员拆解</div>' +
+        '<div class="person-project-detail-expanded-meta">' +
+          '<span>需求部门：' + escapeHtml(project.demandDept || '-') + '</span>' +
+          '<span>产品名称：' + escapeHtml(project.product || '-') + '</span>' +
+          '<span>细分类型：' + escapeHtml(project.demandType || '-') + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="person-project-detail-split">' +
+        '<div class="person-project-detail-block">' +
+          '<div class="person-inline-hint">按【评估效率】降序</div>' +
+          '<div class="person-project-detail-table-wrap">' +
+            '<table class="person-project-expanded-table">' +
+              '<thead><tr><th rowspan="2">制作部门</th><th rowspan="2">制作人员</th><th rowspan="2">效率分类</th><th rowspan="2">评估效率</th><th rowspan="2"><span class="person-th-label">实际耗时</span><span class="person-th-unit">【小时】</span></th><th rowspan="2"><span class="person-th-label">标准耗时</span><span class="person-th-unit">【小时】</span></th><th rowspan="2">纳入评估产出数</th><th colspan="' + months.length + '">评估效率</th></tr><tr>' + monthHead + '</tr></thead>' +
+              '<tbody>' + peopleBody + '</tbody>' +
+            '</table>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+  '</td></tr>';
+}
+
+function buildPersonProjectDetailTableHtml() {
+  const groups = getPersonProjectGroups(true);
+  const months = PERSON_EFFICIENCY_DATA.months || ['2026-03', '2026-04', '2026-05'];
+  const monthHeaders = months.map(month => '<th>' + escapeHtml(month) + '</th>').join('');
+  const baseWeight = 8 + 1.18 + months.length * 0.72;
+  const projectRegularWidth = (100 / baseWeight).toFixed(2);
+  const projectProductWidth = (projectRegularWidth * 1.18).toFixed(2);
+  const projectMonthWidth = (projectRegularWidth * 0.72).toFixed(2);
+  const colGroup = '<colgroup>' +
+    '<col style="width:' + projectRegularWidth + '%">' +
+    '<col style="width:' + projectProductWidth + '%">' +
+    Array.from({length: 7}).map(() => '<col style="width:' + projectRegularWidth + '%">').join('') +
+    months.map(() => '<col style="width:' + projectMonthWidth + '%">').join('') +
+  '</colgroup>';
+  const tableHead = '<thead>' +
+    '<tr>' +
+      '<th rowspan="2">需求部门</th><th rowspan="2">产品名称</th><th rowspan="2">细分类型</th><th rowspan="2">制作部门</th>' +
+      '<th rowspan="2">效率分类</th><th rowspan="2">评估效率</th><th rowspan="2"><span class="person-th-label">单片耗时</span><span class="person-th-unit">【分钟】</span></th><th rowspan="2">单片收费</th><th rowspan="2">纳入评估产出数</th>' +
+      '<th colspan="' + months.length + '">评估效率</th>' +
+    '</tr>' +
+    '<tr>' + monthHeaders + '</tr>' +
+  '</thead>';
+  const colSpan = 9 + months.length;
+  const buildProjectCell = function(content, extraClass, dimmed) {
+    return '<td' + (extraClass ? ' class="' + extraClass + '"' : '') + '><div class="person-project-cell-content' + (dimmed ? ' dimmed' : '') + '">' + content + '</div></td>';
+  };
+  const body = groups.length ? groups.map(group => {
+    const expanded = appState.personProjectDetailExpandedKey === group.key;
+    const rowspan = group.rows.length;
+    const rowsHtml = group.rows.map((row, idx) => {
+      const rowDimmed = ((appState.personProjectDetailExpandedKey && !expanded) || (hasProjectSoftFilters() && !isProjectRowHighlighted(row)));
+      return '<tr class="person-project-detail-row person-project-group-row' + (idx === 0 ? ' group-start' : '') + (expanded ? ' active' : '') + (rowDimmed ? ' dimmed' : '') + '">' +
+        (idx === 0
+          ? '<td rowspan="' + rowspan + '" class="person-project-merged-cell">' + escapeHtml(group.demandDept || '-') + '</td>' +
+            '<td rowspan="' + rowspan + '" class="person-project-merged-cell">' +
+              '<button class="person-project-name-btn" type="button" onclick="togglePersonProjectDetail(\'' + escapeHtmlAttr(group.key) + '\')"><span class="person-name-text">' + escapeHtml(group.product || '-') + '</span><span class="person-link-cue" aria-hidden="true">›</span></button>' +
+            '</td>' +
+            '<td rowspan="' + rowspan + '" class="person-project-merged-cell">' + escapeHtml(group.demandType || '-') + '</td>'
+          : '') +
+        buildProjectCell(escapeHtml(row.dept || '-'), '', rowDimmed) +
+        buildProjectCell(buildPersonClassBadge(classifyPersonEfficiency(row.efficiency)), '', rowDimmed) +
+        buildProjectCell(buildPersonEfficiencyValue(row.efficiency), 'num', rowDimmed) +
+        buildProjectCell(formatPersonNumber(row.singleTimeMinutes, 1), 'num', rowDimmed) +
+        buildProjectCell(formatPersonNumber(row.unitFee, 2), 'num', rowDimmed) +
+        buildProjectCell(formatPersonNumber(row.evaluatedOutput, 0), 'num', rowDimmed) +
+        months.map(month => buildProjectCell(buildPersonEfficiencyValue((row.monthlyEfficiency || {})[month]), 'num', rowDimmed)).join('') +
+      '</tr>';
+    }).join('');
+    return rowsHtml + (expanded ? buildPersonProjectDetailExpandedHtml(group.rows[0], colSpan) : '');
+  }).join('') : '<tr><td colspan="' + colSpan + '" class="person-empty-cell">' +
+    (appState.projectShowLowDemand
+      ? '当前筛选下暂无项目明细。'
+      : '当前筛选下暂无产出数≥100的项目，可开启“显示低需求项目”查看。') +
+    '</td></tr>';
+
+  return '<section class="person-panel">' +
+    '<div class="person-section-head"><div><div class="person-section-title">项目明细表</div><div class="person-section-hint">按【产出数】降序，点击【产品名称】查看人员拆解</div></div></div>' +
+    '<div class="person-table-filter-panel person-project-filter-panel">' + buildPersonProjectControlsHtml() + '</div>' +
+    '<div class="person-table-scroll">' +
+      '<table class="person-main-table person-project-detail-table">' +
+        colGroup +
+        tableHead +
+        '<tbody>' + body + '</tbody>' +
+      '</table>' +
+    '</div>' +
+  '</section>';
+}
+
+function buildPersonProjectPeopleHtml(project) {
+  if (!project.people || !project.people.length) return '<div class="person-empty">暂无人员对比数据。</div>';
+  return '<div class="person-project-people-wrap">' +
+    '<table class="person-project-people-table">' +
+      '<thead><tr><th>制作部门</th><th>制作人员</th><th>员工状态</th><th>在职年数</th><th>效率分类</th><th>评估效率</th><th>节省工时</th><th>实际耗时</th><th>基准耗时</th><th>产出数</th><th>基准覆盖率</th></tr></thead>' +
+      '<tbody>' + project.people.map(item =>
+        '<tr>' +
+          '<td>' + escapeHtml(item.dept) + '</td>' +
+          '<td>' + escapeHtml(item.person) + '</td>' +
+          '<td>' + buildEmployeeStatusBadge(item) + '</td>' +
+          '<td class="num">' + formatPersonTenure(item.tenureYears) + '</td>' +
+          '<td>' + buildPersonClassBadge(item.className) + '</td>' +
+          '<td class="num">' + formatPersonEfficiency(item.efficiency) + '</td>' +
+          '<td class="num ' + ((item.savedWorkload || 0) >= 0 ? 'person-good' : 'person-bad') + '">' + formatPersonNumber(item.savedWorkload, 1) + '</td>' +
+          '<td class="num">' + formatPersonNumber(item.evaluatedWorkload, 1) + '</td>' +
+          '<td class="num">' + formatPersonNumber(item.expectedWorkload, 1) + '</td>' +
+          '<td class="num">' + formatPersonNumber(item.evaluatedOutput, 0) + '</td>' +
+          '<td class="num">' + formatPersonPct(item.baselineCoverage) + '</td>' +
+        '</tr>'
+      ).join('') + '</tbody>' +
+    '</table>' +
+  '</div>';
+}
+
+function buildPersonProjectSectionHtml() {
+  const projects = (PERSON_EFFICIENCY_DATA.topProjectsByPeriod || {})[appState.personPeriod] || [];
+  if (!projects.length) return '<section class="person-panel"><div class="person-section-title">需求量 TOP10 项目人员效率对比</div><div class="person-empty">当前统计范围暂无满足制作部门数 >= 2 的项目。</div></section>';
+  return '<section class="person-panel" id="personProjectSection">' +
+    '<div class="person-section-head"><div><div class="person-section-title">需求量 TOP10 项目人员效率对比</div></div></div>' +
+    '<div class="person-project-list">' +
+      projects.map((project, idx) => {
+        const open = appState.personProjectExpanded === idx;
+        const title = [project.center, project.demandDept, project.product, project.businessUnit].filter(Boolean).join(' / ');
+        return '<div class="person-project-card">' +
+          '<button class="person-project-head" type="button" onclick="togglePersonProject(' + idx + ')">' +
+            '<span class="person-project-rank">#' + (idx + 1) + '</span>' +
+            '<span class="person-project-title">' + escapeHtml(title || '-') + '</span>' +
+            '<span class="person-project-metrics">产出 ' + formatPersonNumber(project.output, 0) + ' · 部门 ' + project.deptCount + ' · 评估效率 ' + formatPersonEfficiency(project.efficiency) + '</span>' +
+          '</button>' +
+          (open ? buildPersonProjectPeopleHtml(project) : '') +
+        '</div>';
+      }).join('') +
+    '</div>' +
+  '</section>';
+}
+
+function renderPersonProjectSection() {
+  const section = document.getElementById('personProjectMount');
+  if (section) section.innerHTML = buildPersonProjectSectionHtml();
+}
+
+function renderPersonEfficiencyPage(container) {
+  if (!PERSON_EFFICIENCY_DATA.rows || !PERSON_EFFICIENCY_DATA.rows.length) {
+    container.innerHTML = '<section class="person-page"><div class="person-empty">暂无人员效率数据。</div></section>';
+    return;
+  }
+  if (!getPersonPeriods().includes(appState.personPeriod)) {
+    appState.personPeriod = getPersonPeriods()[0];
+  }
+  container.innerHTML =
+    '<section class="person-page">' +
+      buildPersonLogicHtml() +
+      buildPersonDepartmentSummaryHtml() +
+      buildPersonAnalysisHtml() +
+      buildPersonMainTableHtml() +
+      buildPersonProjectDetailTableHtml() +
+    '</section>';
+  renderPersonDepartmentCharts();
 }
 
 // Initial render runs after the overview v2 overrides below.
@@ -1687,6 +3179,23 @@ function getWeekRangeLabelV3(weekKey) {
   const start = getIsoWeekStartV3(parsed.year, parsed.week);
   const end = getWeekEndDateV3(weekKey);
   return weekKey + ' | ' + formatUtcMMDDRangeV3(start, end, '-');
+}
+
+function getContentEditingWeekRangeLabelV3(weekKey) {
+  const parsed = parseWeekKeyV3(weekKey);
+  if (!parsed) return weekKey || '-';
+  const workdayStart = getIsoWeekStartV3(parsed.year, parsed.week);
+  const workdayEnd = getWeekEndDateV3(weekKey);
+  const materialStart = addUtcDaysV3(workdayStart, -3);
+  const materialEnd = addUtcDaysV3(workdayStart, 3);
+  return weekKey + ' | 素材 ' + formatUtcMMDDRangeV3(materialStart, materialEnd, '-') +
+    ' | 工作日 ' + formatUtcMMDDRangeV3(workdayStart, workdayEnd, '-');
+}
+
+function getModuleWeekRangeLabelV3(moduleName, weekKey) {
+  return moduleName === CONTENT_EDITING_MODULE
+    ? getContentEditingWeekRangeLabelV3(weekKey)
+    : getWeekRangeLabelV3(weekKey);
 }
 
 function getWeekSpanLabelV3(weekLabels) {
@@ -1899,6 +3408,7 @@ function renderShell() {
 
   const overviewActive = appState.mainView === 'overview' ? ' active' : '';
   const businessActive = appState.mainView === 'business' ? ' active' : '';
+  const personActive = appState.mainView === 'person' ? ' active' : '';
   const app = document.getElementById('app');
   app.innerHTML =
     '<div class="bi-shell">' +
@@ -1906,6 +3416,7 @@ function renderShell() {
         '<button class="top-nav-btn top-nav-primary' + overviewActive + '" type="button" onclick="setMainView(\'overview\')"'+ (overviewActive ? ' aria-current="page"' : '') +'>' + OVERVIEW_TEXT_V3.overview + '</button>' +
         '<div class="top-nav-section" aria-label="素材模块">' + moduleNavButtons + '</div>' +
         '<button class="top-nav-btn top-nav-primary' + businessActive + '" type="button" onclick="setMainView(\'business\')"'+ (businessActive ? ' aria-current="page"' : '') +'>' + OVERVIEW_TEXT_V3.inputOutput + '</button>' +
+        '<button class="top-nav-btn top-nav-primary' + personActive + '" type="button" onclick="setMainView(\'person\')"'+ (personActive ? ' aria-current="page"' : '') +'>人员效率</button>' +
         '<button class="top-nav-btn top-nav-export-btn" type="button" onclick="openLongImageExportDialog()">\u5bfc\u51fa\u957f\u56fe</button>' +
       '</div>' +
       '<div id="viewRoot"></div>' +
@@ -1934,7 +3445,7 @@ function renderModuleShell(container) {
   const latestWeek = WEEK_LABELS[WEEK_LABELS.length - 1] || '';
   const moduleToolbarNote = getModuleToolbarNote(activeModule);
   const latestWeekHint = appState.modulePeriod === 'weekly' && latestWeek
-    ? '<div class="period-range-callout">最新周 ' + getWeekRangeLabelV3(latestWeek) + '</div>'
+    ? '<div class="period-range-callout">最新周 ' + getModuleWeekRangeLabelV3(activeModule, latestWeek) + '</div>'
     : '';
   const moduleToolbarNoteInput =
     '<input class="module-toolbar-note-input" type="text" value="' + escapeHtmlAttr(moduleToolbarNote) + '" ' +
@@ -1949,6 +3460,7 @@ function renderModuleShell(container) {
             moduleToolbarNoteInput +
           '</div>' +
           '<div class="toggle-btns">' +
+            '<button class="toggle-btn anomaly-toggle-btn' + (appState.anomalyBriefVisible ? ' active' : '') + '" onclick="toggleAnomalyBrief()">波动分析</button>' +
             '<button class="toggle-btn' + (appState.modulePeriod === 'monthly' ? ' active' : '') + '" onclick="switchModulePeriod(\'monthly\')">\u6708\u5ea6</button>' +
             '<button class="toggle-btn' + (appState.modulePeriod === 'weekly' ? ' active' : '') + '" onclick="switchModulePeriod(\'weekly\')">\u5468\u5ea6</button>' +
           '</div>' +

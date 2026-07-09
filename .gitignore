@@ -5,6 +5,7 @@ __pycache__/
 # 虚拟环境
 venv/
 .env/
+node_modules/
 
 # IDE
 .vscode/

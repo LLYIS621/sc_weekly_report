@@ -12,9 +12,11 @@
 import openpyxl
 import json
 import calendar
-from datetime import date, timedelta
+import html as html_lib
+from datetime import date, datetime, timedelta
 import os
 import re
+import importlib.util
 from collections import defaultdict
 
 # ============================================================
@@ -80,6 +82,8 @@ BASE_DIR = os.path.dirname(SCRIPT_DIR)
 EXCEL_PATH = os.path.join(BASE_DIR, '素材数据源.xlsx')
 OUTPUT_PATH = os.path.join(SCRIPT_DIR, 'index.html')
 TEMPLATE_PATH = os.path.join(SCRIPT_DIR, 'template.html')
+ROSTER_READER_PATH = r'C:\Users\Lly621\Desktop\py_calc\code\read_my_data.py'
+MANUAL_DATA_PATH = os.path.join(BASE_DIR, '运营团队手动维护数据.xlsx')
 
 
 def main():
@@ -237,8 +241,26 @@ def main():
     # ============================================================
     # 辅助函数
     # ============================================================
+    def parse_source_date(value):
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value)
+            except ValueError:
+                return None
+        if hasattr(value, 'year'):
+            return date(value.year, value.month, value.day)
+        return None
+
+    def get_content_editing_week_key(row):
+        source_date = parse_source_date(row.get('统计日期'))
+        if not source_date:
+            return row.get('统计周数')
+        iso_year, iso_week, _ = (source_date + timedelta(days=3)).isocalendar()
+        return f'{iso_year % 100:02d}W{iso_week}'
+
     def filter_source_rows(business_units=None, posts=None, biz_source=None,
-                           exclude_data_sources=None, months=None, weeks=None, depts=None):
+                           exclude_data_sources=None, months=None, weeks=None, depts=None,
+                           week_key_getter=None):
         candidates = None
         if months:
             candidates = []
@@ -248,7 +270,7 @@ def main():
                         candidates.extend(ROWS_BY_MONTH_DEPT.get((month_key, dept), []))
                 else:
                     candidates.extend(ROWS_BY_MONTH.get(month_key, []))
-        elif weeks:
+        elif weeks and not week_key_getter:
             candidates = []
             for week_key in weeks:
                 if depts:
@@ -273,7 +295,8 @@ def main():
                 continue
             if months and row.get('统计年月') not in months:
                 continue
-            if weeks and row.get('统计周数') not in weeks:
+            row_week_key = week_key_getter(row) if week_key_getter else row.get('统计周数')
+            if weeks and row_week_key not in weeks:
                 continue
             filtered_rows.append(row)
         return filtered_rows
@@ -353,6 +376,11 @@ def main():
             'avg_daily_workload': round(avg_daily_workload, 4),
             'saturation': round(saturation, 4),
             'single_time': round(single_time, 2),
+            'workdays': workdays,
+            'output_manpower': round(manpower_output, 2),
+            'workload_manpower': round(manpower_workload, 2),
+            'total_workload': round(total_workload, 2),
+            'efficiency_output': round(efficiency_output, 2),
         }
 
 
@@ -394,6 +422,611 @@ def main():
         # 过滤掉三个字段都为空的无效记录
         valid = {p for p in projects if any(p)}
         return len(valid)
+
+    PERSON_EFFICIENCY_CLASSES = ['高效率', '正常', '待提升']
+    PERSON_EFFICIENCY_MONTHS = ['2026-03', '2026-04', '2026-05']
+    PERSON_EFFICIENCY_PERIOD = '2026-03~2026-05'
+    PERSON_HIGH_EFFICIENCY_THRESHOLD = 1.2
+    PERSON_NORMAL_EFFICIENCY_THRESHOLD = 1.0
+    PERSON_STANDARD_CARD_ORDER = {
+        '混剪': ['常规混剪', '复杂混剪', '混剪修改', '脚本&剪辑'],
+        '图片': ['整图设计', '套模板整图', '复杂修改', '简单修改', '宫格小图', '轮播小图', '设计找图', '多屏长图', '落地页设计', '创意品牌图'],
+        '实拍': ['实拍剪辑'],
+    }
+
+    def pe_norm(value):
+        return str(value).strip() if value is not None else ''
+
+    def pe_number(value):
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def pe_settlement_dept(row):
+        dept = pe_norm(row.get('制作部门-结算')) or pe_norm(row.get('制作部门'))
+        if dept == '品牌设计部-内容':
+            return '内容一部'
+        return dept
+
+    def pe_page_business_unit(value):
+        unit = pe_norm(value)
+        if unit == '内容部常规':
+            return '实拍'
+        return unit
+
+    def pe_page_demand_type(row):
+        if pe_norm(row.get('业务单元')) == '内容部常规':
+            return '实拍剪辑'
+        return pe_norm(row.get('需求类型'))
+
+    def pe_standard_key_for_row(row):
+        return (
+            pe_page_business_unit(row.get('业务单元')),
+            pe_page_demand_type(row),
+        )
+
+    def pe_classify_efficiency(value):
+        if value is None:
+            return '无标准'
+        if value >= PERSON_HIGH_EFFICIENCY_THRESHOLD:
+            return '高效率'
+        if value >= PERSON_NORMAL_EFFICIENCY_THRESHOLD:
+            return '正常'
+        return '待提升'
+
+    def pe_parse_date(value):
+        if value is None or value == '':
+            return None
+        if isinstance(value, datetime):
+            return date(value.year, value.month, value.day)
+        if isinstance(value, date):
+            return value
+        if hasattr(value, 'to_pydatetime'):
+            value = value.to_pydatetime()
+        if hasattr(value, 'year') and hasattr(value, 'month') and hasattr(value, 'day'):
+            return date(value.year, value.month, value.day)
+        text = pe_norm(value)
+        if not text or text.lower() in {'nat', 'nan', 'none'}:
+            return None
+        for fmt in ('%Y-%m-%d', '%Y/%m/%d', '%Y.%m.%d', '%Y-%m-%d %H:%M:%S'):
+            try:
+                parsed = datetime.strptime(text[:19], fmt)
+                return date(parsed.year, parsed.month, parsed.day)
+            except ValueError:
+                pass
+        return None
+
+    def pe_format_date(value):
+        parsed = pe_parse_date(value)
+        return parsed.isoformat() if parsed else ''
+
+    def read_employee_roster(cutoff_date):
+        """读取花名册，用制作人员姓名匹配员工状态和在职年数。"""
+        if not os.path.exists(ROSTER_READER_PATH):
+            print(f'  花名册读取跳过: 未找到 {ROSTER_READER_PATH}')
+            return {}
+        try:
+            spec = importlib.util.spec_from_file_location('external_roster_reader', ROSTER_READER_PATH)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            roster_df = module.read_my_data('SELECT `姓名`, `员工状态`, `入职时间`, `离职时间` FROM `花名册`')
+        except Exception as exc:
+            print(f'  花名册读取失败: {exc}')
+            return {}
+
+        roster = {}
+        duplicate_names = set()
+        for _, row in roster_df.iterrows():
+            name = pe_norm(row.get('姓名'))
+            if not name:
+                continue
+            status = pe_norm(row.get('员工状态'))
+            join_date = pe_parse_date(row.get('入职时间'))
+            leave_date = pe_parse_date(row.get('离职时间'))
+            is_resigned = ('离职' in status) or (leave_date is not None and leave_date <= cutoff_date)
+            end_date = leave_date if is_resigned and leave_date else cutoff_date
+            tenure_years = None
+            if join_date and end_date >= join_date:
+                tenure_years = round((end_date - join_date).days / 365.25, 1)
+            item = {
+                'employeeStatus': status or ('已离职' if is_resigned else '在职'),
+                'isResigned': is_resigned,
+                'joinDate': join_date.isoformat() if join_date else '',
+                'leaveDate': leave_date.isoformat() if leave_date else '',
+                'tenureYears': tenure_years,
+                'rosterMatched': True,
+            }
+            if name in roster:
+                duplicate_names.add(name)
+                old = roster[name]
+                old_active = not old.get('isResigned')
+                new_active = not item.get('isResigned')
+                if old_active and not new_active:
+                    continue
+                if old_active == new_active and (old.get('joinDate') or '') >= (item.get('joinDate') or ''):
+                    continue
+            roster[name] = item
+
+        print(f'  花名册: {len(roster)} 人')
+        if duplicate_names:
+            print(f'  花名册同名人员: {len(duplicate_names)} 人，已优先保留在职或较新入职记录')
+        return roster
+
+    def is_person_efficiency_row(row):
+        business_unit = pe_norm(row.get('业务单元'))
+        post = pe_norm(row.get('岗位'))
+        return (
+            pe_norm(row.get('业务来源')) == '广告投流'
+            and (
+                (business_unit == '图片' and post == '设计')
+                or (business_unit == '混剪' and post == '剪辑')
+                or (business_unit == '内容部常规' and post == '剪辑')
+            )
+            and pe_number(row.get('产出数')) > 0
+            and pe_number(row.get('周报工作量')) > 0
+            and pe_number(row.get('是否实习生')) != 1
+            and pe_norm(row.get('制作人员'))
+            and pe_norm(row.get('统计年月')) in PERSON_EFFICIENCY_MONTHS
+        )
+
+    def read_material_efficiency_standards():
+        standard_values = defaultdict(list)
+        if not os.path.exists(MANUAL_DATA_PATH):
+            print(f'  素材效率标准读取跳过: 未找到 {MANUAL_DATA_PATH}')
+            return {}, []
+        try:
+            wb_manual = openpyxl.load_workbook(MANUAL_DATA_PATH, read_only=True, data_only=True)
+            ws_standard = wb_manual['素材效率标准']
+            headers = [pe_norm(value) for value in next(ws_standard.iter_rows(values_only=True))]
+            idx = {name: i for i, name in enumerate(headers)}
+            required = ['业务单元', '需求类型', '标准耗时']
+            missing = [name for name in required if name not in idx]
+            if missing:
+                print(f"  素材效率标准读取失败: 缺少字段 {', '.join(missing)}")
+                wb_manual.close()
+                return {}, []
+            for row in ws_standard.iter_rows(min_row=2, values_only=True):
+                unit = pe_page_business_unit(row[idx['业务单元']])
+                demand_type = pe_norm(row[idx['需求类型']])
+                standard_minutes = pe_number(row[idx['标准耗时']])
+                if not unit or not demand_type or standard_minutes <= 0:
+                    continue
+                standard_values[(unit, demand_type)].append(standard_minutes)
+            wb_manual.close()
+        except Exception as exc:
+            print(f'  素材效率标准读取失败: {exc}')
+            return {}, []
+        standards = {}
+        standard_cards = defaultdict(list)
+        for (unit, demand_type), values in standard_values.items():
+            standard_minutes = sum(values) / len(values)
+            standards[(unit, demand_type)] = {
+                'businessUnit': unit,
+                'demandType': demand_type,
+                'standardMinutes': standard_minutes,
+                'standardHours': standard_minutes / 60,
+                'sourceCount': len(values),
+            }
+            standard_cards[unit].append({
+                'businessUnit': unit,
+                'demandType': demand_type,
+                'standardMinutes': round(standard_minutes, 2),
+                'sourceCount': len(values),
+            })
+        def card_sort_key(unit, item):
+            order = PERSON_STANDARD_CARD_ORDER.get(unit, [])
+            try:
+                index = order.index(item['demandType'])
+            except ValueError:
+                index = len(order) + 999
+            return (index, item['demandType'])
+
+        standard_cards = {
+            unit: sorted(items, key=lambda item, unit_name=unit: card_sort_key(unit_name, item))
+            for unit, items in sorted(standard_cards.items(), key=lambda pair: pair[0])
+        }
+        print(f'  素材效率标准: {len(standards)} 条')
+        return standards, standard_cards
+
+    PERSON_ROSTER_BY_NAME = read_employee_roster(date(2026, 5, 31))
+    PERSON_STANDARD_BY_TYPE, PERSON_STANDARD_CARDS = read_material_efficiency_standards()
+
+    def pe_roster_info(person):
+        return PERSON_ROSTER_BY_NAME.get(person, {
+            'employeeStatus': '未匹配',
+            'isResigned': False,
+            'joinDate': '',
+            'leaveDate': '',
+            'tenureYears': None,
+            'tenureDays': None,
+            'rosterMatched': False,
+        })
+
+    def pe_tenure_days(roster_info):
+        join_date = pe_parse_date(roster_info.get('joinDate'))
+        leave_date = pe_parse_date(roster_info.get('leaveDate'))
+        if not join_date:
+            return None
+        end_date = leave_date if leave_date else date(2026, 5, 31)
+        if end_date < join_date:
+            return None
+        return (end_date - join_date).days + 1
+
+    def pe_standard_for_row(row):
+        return PERSON_STANDARD_BY_TYPE.get(pe_standard_key_for_row(row))
+
+    def new_person_efficiency_item(period, row, business_unit):
+        person = pe_norm(row.get('制作人员'))
+        roster_info = pe_roster_info(person)
+        tenure_days = pe_tenure_days(roster_info)
+        return {
+            'period': period,
+            'dept': pe_settlement_dept(row),
+            'person': person,
+            'employeeStatus': roster_info['employeeStatus'],
+            'isResigned': roster_info['isResigned'],
+            'joinDate': roster_info['joinDate'],
+            'leaveDate': roster_info['leaveDate'],
+            'tenureYears': roster_info['tenureYears'],
+            'tenureDays': tenure_days,
+            'rosterMatched': roster_info['rosterMatched'],
+            'businessUnit': business_unit,
+            'totalOutput': 0.0,
+            'totalWorkload': 0.0,
+            'evaluatedOutput': 0.0,
+            'evaluatedWorkload': 0.0,
+            'standardWorkload': 0.0,
+            'sampleMissingOutput': 0.0,
+            'sampleMissingWorkload': 0.0,
+            'monthly': {month: {'standardWorkload': 0.0, 'evaluatedWorkload': 0.0} for month in PERSON_EFFICIENCY_MONTHS},
+        }
+
+    def finish_person_efficiency_item(item):
+        standard = item['standardWorkload']
+        total_output = item['totalOutput']
+        evaluated_output = item['evaluatedOutput']
+        evaluated_workload = item['evaluatedWorkload']
+        if standard > 0 and evaluated_workload > 0:
+            item['efficiency'] = round(standard / evaluated_workload, 4)
+        else:
+            item['efficiency'] = None
+        item['standardCoverage'] = round(evaluated_output / total_output, 4) if total_output else 0
+        item['sampleMissingShare'] = round(item['sampleMissingOutput'] / total_output, 4) if total_output else 0
+        item['eligible'] = standard > 0 and evaluated_workload > 0
+        item['className'] = pe_classify_efficiency(item['efficiency'])
+        item['monthlyEfficiency'] = {}
+        for month, month_item in item['monthly'].items():
+            if month_item['standardWorkload'] > 0 and month_item['evaluatedWorkload'] > 0:
+                item['monthlyEfficiency'][month] = round(month_item['standardWorkload'] / month_item['evaluatedWorkload'], 4)
+            else:
+                item['monthlyEfficiency'][month] = None
+        for key in ['totalOutput', 'totalWorkload', 'evaluatedOutput', 'evaluatedWorkload',
+                    'standardWorkload', 'sampleMissingOutput', 'sampleMissingWorkload']:
+            item[key] = round(item[key], 2)
+        item.pop('monthly', None)
+        return item
+
+    def summarize_person_efficiency_period(period, rows):
+        person_items = {}
+        detail_items = {}
+        project_detail_items = {}
+        project_items = {}
+
+        for row in rows:
+            month = pe_norm(row.get('统计年月'))
+            output = pe_number(row.get('产出数'))
+            workload = pe_number(row.get('周报工作量'))
+            estimated_fee = pe_number(row.get('预估费用'))
+            standard = pe_standard_for_row(row)
+            standard_workload = output * standard['standardHours'] if standard else 0.0
+
+            person_keys = [
+                (pe_settlement_dept(row), pe_norm(row.get('制作人员')), pe_page_business_unit(row.get('业务单元'))),
+                (pe_settlement_dept(row), pe_norm(row.get('制作人员')), '总计'),
+            ]
+            for person_key in person_keys:
+                item = person_items.setdefault(person_key, new_person_efficiency_item(period, row, person_key[2]))
+                item['totalOutput'] += output
+                item['totalWorkload'] += workload
+                if standard:
+                    item['evaluatedOutput'] += output
+                    item['evaluatedWorkload'] += workload
+                    item['standardWorkload'] += standard_workload
+                    if month in item['monthly']:
+                        item['monthly'][month]['standardWorkload'] += standard_workload
+                        item['monthly'][month]['evaluatedWorkload'] += workload
+                else:
+                    item['sampleMissingOutput'] += output
+                    item['sampleMissingWorkload'] += workload
+
+            detail_key = (
+                pe_settlement_dept(row),
+                pe_norm(row.get('制作人员')),
+                pe_page_business_unit(row.get('业务单元')),
+                pe_norm(row.get('修正需求部门')),
+                pe_norm(row.get('修正产品')),
+                pe_page_demand_type(row),
+            )
+            detail = detail_items.setdefault(detail_key, {
+                'period': period,
+                'dept': detail_key[0],
+                'person': detail_key[1],
+                'businessUnit': detail_key[2],
+                'demandDept': detail_key[3],
+                'product': detail_key[4],
+                'demandType': detail_key[5],
+                'output': 0.0,
+                'workload': 0.0,
+                'estimatedFee': 0.0,
+                'evaluatedOutput': 0.0,
+                'evaluatedWorkload': 0.0,
+                'standardWorkload': 0.0,
+                'standardMinutes': standard['standardMinutes'] if standard else None,
+                'standardMatched': bool(standard),
+                'monthly': {month: {'standardWorkload': 0.0, 'evaluatedWorkload': 0.0} for month in PERSON_EFFICIENCY_MONTHS},
+            })
+            detail['output'] += output
+            detail['workload'] += workload
+            detail['estimatedFee'] += estimated_fee
+            if standard:
+                detail['evaluatedOutput'] += output
+                detail['evaluatedWorkload'] += workload
+                detail['standardWorkload'] += standard_workload
+                if month in detail['monthly']:
+                    detail['monthly'][month]['standardWorkload'] += standard_workload
+                    detail['monthly'][month]['evaluatedWorkload'] += workload
+
+            project_detail_key = (
+                pe_settlement_dept(row),
+                pe_page_business_unit(row.get('业务单元')),
+                pe_norm(row.get('修正需求部门')),
+                pe_norm(row.get('修正产品')),
+                pe_page_demand_type(row),
+            )
+            project_detail = project_detail_items.setdefault(project_detail_key, {
+                'period': period,
+                'dept': project_detail_key[0],
+                'businessUnit': project_detail_key[1],
+                'demandDept': project_detail_key[2],
+                'product': project_detail_key[3],
+                'demandType': project_detail_key[4],
+                'output': 0.0,
+                'workload': 0.0,
+                'estimatedFee': 0.0,
+                'evaluatedOutput': 0.0,
+                'evaluatedWorkload': 0.0,
+                'standardWorkload': 0.0,
+                'monthly': {month: {'standardWorkload': 0.0, 'evaluatedWorkload': 0.0} for month in PERSON_EFFICIENCY_MONTHS},
+            })
+            project_detail['output'] += output
+            project_detail['workload'] += workload
+            project_detail['estimatedFee'] += estimated_fee
+            if standard:
+                project_detail['evaluatedOutput'] += output
+                project_detail['evaluatedWorkload'] += workload
+                project_detail['standardWorkload'] += standard_workload
+                if month in project_detail['monthly']:
+                    project_detail['monthly'][month]['standardWorkload'] += standard_workload
+                    project_detail['monthly'][month]['evaluatedWorkload'] += workload
+
+            project_key = (
+                pe_norm(row.get('修正所属中心')),
+                pe_norm(row.get('修正需求部门')),
+                pe_norm(row.get('修正产品')),
+                pe_page_business_unit(row.get('业务单元')),
+            )
+            project = project_items.setdefault(project_key, {
+                'period': period,
+                'center': project_key[0],
+                'demandDept': project_key[1],
+                'product': project_key[2],
+                'businessUnit': project_key[3],
+                'output': 0.0,
+                'workload': 0.0,
+                'evaluatedOutput': 0.0,
+                'evaluatedWorkload': 0.0,
+                'standardWorkload': 0.0,
+                'depts': set(),
+                'persons': set(),
+                'people': {},
+            })
+            project['output'] += output
+            project['workload'] += workload
+            project['depts'].add(pe_settlement_dept(row))
+            project['persons'].add(pe_norm(row.get('制作人员')))
+            if standard:
+                project['evaluatedOutput'] += output
+                project['evaluatedWorkload'] += workload
+                project['standardWorkload'] += standard_workload
+
+            project_person_key = (pe_settlement_dept(row), pe_norm(row.get('制作人员')))
+            project_roster_info = pe_roster_info(project_person_key[1])
+            project_person = project['people'].setdefault(project_person_key, {
+                'dept': project_person_key[0],
+                'person': project_person_key[1],
+                'employeeStatus': project_roster_info['employeeStatus'],
+                'isResigned': project_roster_info['isResigned'],
+                'joinDate': project_roster_info['joinDate'],
+                'leaveDate': project_roster_info['leaveDate'],
+                'tenureYears': project_roster_info['tenureYears'],
+                'tenureDays': pe_tenure_days(project_roster_info),
+                'rosterMatched': project_roster_info['rosterMatched'],
+                'output': 0.0,
+                'workload': 0.0,
+                'evaluatedOutput': 0.0,
+                'evaluatedWorkload': 0.0,
+                'standardWorkload': 0.0,
+                'sampleMissingOutput': 0.0,
+            })
+            project_person['output'] += output
+            project_person['workload'] += workload
+            if standard:
+                project_person['evaluatedOutput'] += output
+                project_person['evaluatedWorkload'] += workload
+                project_person['standardWorkload'] += standard_workload
+            else:
+                project_person['sampleMissingOutput'] += output
+
+        rows_result = [finish_person_efficiency_item(item) for item in person_items.values()]
+
+        details_result = []
+        for detail in detail_items.values():
+            standard_workload = detail['standardWorkload']
+            detail['efficiency'] = round(standard_workload / detail['evaluatedWorkload'], 4) if standard_workload > 0 and detail['evaluatedWorkload'] > 0 else None
+            detail['monthlyEfficiency'] = {}
+            for month, month_item in detail['monthly'].items():
+                if month_item['standardWorkload'] > 0 and month_item['evaluatedWorkload'] > 0:
+                    detail['monthlyEfficiency'][month] = round(month_item['standardWorkload'] / month_item['evaluatedWorkload'], 4)
+                else:
+                    detail['monthlyEfficiency'][month] = None
+            for key in ['output', 'workload', 'estimatedFee', 'evaluatedOutput', 'evaluatedWorkload', 'standardWorkload']:
+                detail[key] = round(detail[key], 2)
+            detail.pop('monthly', None)
+            details_result.append(detail)
+
+        project_details_result = []
+        for project_detail in project_detail_items.values():
+            standard_workload = project_detail['standardWorkload']
+            project_detail['efficiency'] = round(standard_workload / project_detail['evaluatedWorkload'], 4) if standard_workload > 0 and project_detail['evaluatedWorkload'] > 0 else None
+            project_detail['monthlyEfficiency'] = {}
+            for month, month_item in project_detail['monthly'].items():
+                if month_item['standardWorkload'] > 0 and month_item['evaluatedWorkload'] > 0:
+                    project_detail['monthlyEfficiency'][month] = round(month_item['standardWorkload'] / month_item['evaluatedWorkload'], 4)
+                else:
+                    project_detail['monthlyEfficiency'][month] = None
+            project_detail['singleTimeMinutes'] = round(project_detail['evaluatedWorkload'] * 60 / project_detail['evaluatedOutput'], 2) if project_detail['evaluatedOutput'] > 0 and project_detail['evaluatedWorkload'] > 0 else None
+            project_detail['unitFee'] = round(project_detail['estimatedFee'] / project_detail['output'], 2) if project_detail['output'] > 0 else None
+            for key in ['output', 'workload', 'estimatedFee', 'evaluatedOutput', 'evaluatedWorkload', 'standardWorkload']:
+                project_detail[key] = round(project_detail[key], 2)
+            project_detail.pop('monthly', None)
+            project_details_result.append(project_detail)
+
+        top_projects = []
+        for project in project_items.values():
+            if len(project['depts']) < 2:
+                continue
+            standard_workload = project['standardWorkload']
+            project['deptCount'] = len(project['depts'])
+            project['personCount'] = len(project['persons'])
+            project['efficiency'] = round(standard_workload / project['evaluatedWorkload'], 4) if standard_workload > 0 and project['evaluatedWorkload'] > 0 else None
+            project['standardCoverage'] = round(project['evaluatedOutput'] / project['output'], 4) if project['output'] else 0
+            class_counts = {name: 0 for name in PERSON_EFFICIENCY_CLASSES}
+            people = []
+            for person_item in project['people'].values():
+                person_standard = person_item['standardWorkload']
+                person_output = person_item['output']
+                evaluated_output = person_item['evaluatedOutput']
+                person_item['efficiency'] = round(person_standard / person_item['evaluatedWorkload'], 4) if person_standard > 0 and person_item['evaluatedWorkload'] > 0 else None
+                person_item['standardCoverage'] = round(evaluated_output / person_output, 4) if person_output else 0
+                person_item['sampleMissingShare'] = round(person_item['sampleMissingOutput'] / person_output, 4) if person_output else 0
+                person_item['className'] = pe_classify_efficiency(person_item['efficiency']) if person_standard > 0 else '无标准'
+                if person_item['className'] in class_counts:
+                    class_counts[person_item['className']] += 1
+                for key in ['output', 'workload', 'evaluatedOutput', 'evaluatedWorkload',
+                            'standardWorkload', 'sampleMissingOutput']:
+                    person_item[key] = round(person_item[key], 2)
+                people.append(person_item)
+            project['people'] = sorted(
+                people,
+                key=lambda x: x['efficiency'] if x['efficiency'] is not None else -999,
+                reverse=True
+            )
+            project['classCounts'] = class_counts
+            for key in ['output', 'workload', 'evaluatedOutput', 'evaluatedWorkload', 'standardWorkload']:
+                project[key] = round(project[key], 2)
+            project['depts'] = sorted(project['depts'])
+            project['persons'] = sorted(project['persons'])
+            top_projects.append(project)
+
+        top_projects = sorted(top_projects, key=lambda x: x['output'], reverse=True)[:10]
+        return rows_result, details_result, project_details_result, top_projects
+
+    def build_person_efficiency_data():
+        base_rows = [row for row in source_rows if is_person_efficiency_row(row)]
+        periods = [PERSON_EFFICIENCY_PERIOD]
+        all_rows = []
+        all_details = []
+        top_projects_by_period = {}
+
+        person_rows, detail_rows, project_detail_rows, top_projects = summarize_person_efficiency_period(PERSON_EFFICIENCY_PERIOD, base_rows)
+        all_rows.extend(person_rows)
+        all_details.extend(detail_rows)
+        all_project_details = project_detail_rows
+        top_projects_by_period[PERSON_EFFICIENCY_PERIOD] = top_projects
+
+        departments = sorted({row['dept'] for row in all_rows if row.get('dept')})
+        department_summary = []
+        for dept in departments:
+            dept_rows = [
+                row for row in all_rows
+                if row.get('dept') == dept and row.get('businessUnit') == '总计' and row.get('eligible')
+            ]
+            if not dept_rows:
+                continue
+            class_counts = {name: 0 for name in PERSON_EFFICIENCY_CLASSES}
+            total_standard = 0.0
+            total_actual = 0.0
+            for row in dept_rows:
+                total_standard += row.get('standardWorkload', 0) or 0
+                total_actual += row.get('evaluatedWorkload', 0) or 0
+                if row.get('className') in class_counts:
+                    class_counts[row['className']] += 1
+            department_summary.append({
+                'dept': dept,
+                'efficiency': round(total_standard / total_actual, 4) if total_standard > 0 and total_actual > 0 else None,
+                'eligibleCount': len(dept_rows),
+                'highCount': class_counts['高效率'],
+                'normalCount': class_counts['正常'],
+                'watchCount': class_counts['待提升'],
+            })
+        return {
+            'periods': periods,
+            'businessUnits': ['总计', '图片', '混剪', '实拍'],
+            'departments': departments,
+            'classNames': PERSON_EFFICIENCY_CLASSES,
+            'months': PERSON_EFFICIENCY_MONTHS,
+            'rows': all_rows,
+            'details': all_details,
+            'projectDetails': all_project_details,
+            'departmentSummary': department_summary,
+            'topProjectsByPeriod': top_projects_by_period,
+            'standardCards': PERSON_STANDARD_CARDS,
+            'readme': {
+                'purpose': [
+                    '用于评估广告投流业务中创意人员在标准耗时口径下的效率表现。',
+                ],
+                'metric': [
+                    {
+                        'title': '报表统计范围',
+                        'text': '',
+                        'highlight': '【26M3~26M5】',
+                    },
+                    {
+                        'title': '实际耗时',
+                        'text': '各团队每月提报的各项目实际制作耗时',
+                    },
+                    {
+                        'title': '标准耗时',
+                        'text': '基于上半年实际制作数据沉淀的类型平均水准，用于标准化效率评估口径（详见右表）',
+                    },
+                    {
+                        'title': '评估效率',
+                        'text': '标准耗时 / 实际耗时，数值越高表示效率越快',
+                        'childrenTitle': '效率分类规则',
+                        'children': [
+                            '高效率：评估效率 >= 1.2',
+                            '正常：1.0 <= 评估效率 < 1.2',
+                            '待提升：评估效率 < 1.0',
+                        ],
+                    },
+                    {
+                        'title': '口径提示',
+                        'text': '本表聚焦标准化口径下的产出效率，少量未纳入标准的素材类型已剔除（如海报，视频制作，图片其他，单图制作等），故不代表员工完整产出量或全部工作量。',
+                    },
+                ],
+            },
+        }
 
     # 计算每月工作日
     month_workdays = {}
@@ -821,15 +1454,20 @@ def main():
                                                          monthly_manpower_business_unit, '产出用')
                     cost_per_capita = get_labor_cost_per_capita(month_key, dept)
                     total_output = dept_month_metrics[dept][month_key]['total_output']
+                    labor_cost_numerator = (output_manpower + offset) * cost_per_capita
                     if total_output > 0:
                         dept_month_metrics[dept][month_key]['single_labor_cost'] = round(
-                            (output_manpower + offset) * cost_per_capita / total_output, 2)
+                            labor_cost_numerator / total_output, 2)
                     else:
                         dept_month_metrics[dept][month_key]['single_labor_cost'] = 0
+                    dept_month_metrics[dept][month_key]['labor_cost_numerator'] = round(labor_cost_numerator, 2)
+                    dept_month_metrics[dept][month_key]['labor_cost_per_capita'] = round(cost_per_capita, 2)
+                    dept_month_metrics[dept][month_key]['labor_cost_offset'] = round(offset, 2)
 
             for month_key in month_periods:
                 total_output = total_month_metrics[month_key]['total_output']
                 manpower_items = []
+                total_labor_cost_numerator = 0
                 for dept in valid_depts:
                     offset = offsets.get(dept, 0)
                     post = department_position_map[dept]
@@ -837,14 +1475,17 @@ def main():
                                                          monthly_manpower_business_unit, '产出用')
                     labor_cost_per_capita = get_labor_cost_per_capita(month_key, dept)
                     manpower_items.append((output_manpower, offset, labor_cost_per_capita))
+                    total_labor_cost_numerator += (output_manpower + offset) * labor_cost_per_capita
                 total_month_metrics[month_key]['single_labor_cost'] = round(
                     calc_single_labor_cost(total_output, manpower_items), 2)
+                total_month_metrics[month_key]['labor_cost_numerator'] = round(total_labor_cost_numerator, 2)
 
         return dept_month_metrics, total_month_metrics
 
     def calculate_weekly_metrics(module_options, module_name, sorted_depts):
         department_position_map = module_options['department_position_map']
         weekly_manpower_business_unit = module_options['weekly_manpower_business_unit']
+        week_key_getter = get_content_editing_week_key if module_name == '内容团队-剪辑' else None
 
         dept_week_metrics = {}
         for dept in sorted_depts:
@@ -857,7 +1498,8 @@ def main():
                     biz_source=module_options['business_source'],
                     exclude_data_sources=module_options['exclude_data_sources'],
                     weeks=[week_key],
-                    depts=[dept]
+                    depts=[dept],
+                    week_key_getter=week_key_getter
                 )
                 output_manpower = get_manpower_value(weekly_manpower_rows, week_key, dept, post,
                                                      weekly_manpower_business_unit, '产出用')
@@ -882,7 +1524,8 @@ def main():
                 biz_source=module_options['business_source'],
                 exclude_data_sources=module_options['exclude_data_sources'],
                 weeks=[week_key],
-                depts=valid_depts
+                depts=valid_depts,
+                week_key_getter=week_key_getter
             )
             total_output_manpower = sum(
                 get_manpower_value(weekly_manpower_rows, week_key, dept, department_position_map[dept],
@@ -1195,6 +1838,631 @@ def main():
         return view_result
 
     # ============================================================
+    # 异常简析数据
+    # ============================================================
+    def safe_pct(curr, prev):
+        if prev in (0, None):
+            return None
+        return (curr - prev) / prev * 100
+
+    def direction_word(diff):
+        return '增加' if diff > 0 else '减少'
+
+    def format_qty(value, unit):
+        value = abs(value)
+        if value >= 100:
+            text = f'{value:.0f}'
+        elif value >= 10:
+            text = f'{value:.1f}'.rstrip('0').rstrip('.')
+        else:
+            text = f'{value:.1f}'.rstrip('0').rstrip('.')
+        return f'{text}{unit}'
+
+    def format_people(value):
+        return f'{abs(value):.1f}'.rstrip('0').rstrip('.') + '人'
+
+    def format_money(value):
+        value = abs(value)
+        if value >= 10000:
+            return f'{value / 10000:.1f}'.rstrip('0').rstrip('.') + '万'
+        return f'{value:.0f}'
+
+    def anomaly_project_html(label):
+        return f'<strong class="anomaly-project">{html_lib.escape(str(label), quote=False)}</strong>'
+
+    def anomaly_delta_html(value, text):
+        tone = 'up' if value > 0 else 'down'
+        return f'<span class="anomaly-delta {tone}">{html_lib.escape(str(text), quote=False)}</span>'
+
+    def anomaly_metric_headline(view, diff_pct, up_word='增加', down_word='减少'):
+        if diff_pct is None:
+            return ''
+        period_word = '周环比' if view == 'weekly' else '月环比'
+        trend = up_word if diff_pct > 0 else down_word
+        return (
+            f'{period_word}{trend}' +
+            anomaly_delta_html(diff_pct, f'{abs(diff_pct):.1f}%')
+        )
+
+    def get_output_unit(module_name):
+        if module_name == '图片':
+            return '张'
+        if module_name == '内容团队-编剧':
+            return '个'
+        return '条'
+
+    def get_project_label(row):
+        demand_dept = (row.get('修正需求部门') or '').strip()
+        product = (row.get('修正产品') or row.get('修正产品名称') or '').strip()
+        if demand_dept and product:
+            return f'{demand_dept} · {product}'
+        if demand_dept:
+            return demand_dept
+        if product:
+            return product
+        return '未知项目'
+
+    def get_project_key(row):
+        demand_dept = (row.get('修正需求部门') or '').strip()
+        product = (row.get('修正产品') or row.get('修正产品名称') or '').strip()
+        return (demand_dept, product)
+
+    def get_rows_for_period(module_options, view, period, dept):
+        period_key = 'months' if view == 'monthly' else 'weeks'
+        week_key_getter = get_content_editing_week_key if module_options['name'] == '内容团队-剪辑' else None
+        return filter_source_rows(
+            business_units=module_options['business_units'],
+            posts=module_options['posts'],
+            biz_source=module_options['business_source'],
+            exclude_data_sources=module_options['exclude_data_sources'],
+            depts=[dept],
+            week_key_getter=week_key_getter,
+            **{period_key: [period]}
+        )
+
+    def build_project_output_map(rows, output_field):
+        project_map = {}
+        for row in rows:
+            key = get_project_key(row)
+            if key not in project_map:
+                project_map[key] = {'label': get_project_label(row), 'output': 0}
+            project_map[key]['output'] += row.get(output_field, 0) or 0
+        return project_map
+
+    def build_project_efficiency_map(rows, output_field):
+        project_map = {}
+        for row in rows:
+            key = get_project_key(row)
+            if key not in project_map:
+                project_map[key] = {'label': get_project_label(row), 'output': 0, 'workload_minutes': 0}
+            project_map[key]['output'] += row.get(output_field, 0) or 0
+            project_map[key]['workload_minutes'] += (row.get('周报工作量', 0) or 0) * 60
+        for item in project_map.values():
+            item['single_time'] = item['workload_minutes'] / item['output'] if item['output'] > 0 else 0
+        return project_map
+
+    SIMPLE_DEMAND_TYPES = {
+        '图片': ['轮播小图', '简单修改', '设计找图', '宫格小图'],
+        '混剪': ['混剪修改'],
+    }
+
+    def is_simple_demand_type(module_name, demand_type):
+        simple_types = SIMPLE_DEMAND_TYPES.get(module_name, [])
+        demand_type_text = str(demand_type or '').strip()
+        return any(simple_type in demand_type_text for simple_type in simple_types)
+
+    def build_period_meta(view, periods):
+        if view == 'weekly':
+            if len(periods) < 2:
+                return {'analysis_period': None, 'compare_period': None, 'label': '周度样本不足'}
+            curr, prev = periods[-1], periods[-2]
+            return {
+                'analysis_period': curr,
+                'compare_period': prev,
+                'skipped_period': None,
+                'label': f'{curr} 对比 {prev}',
+            }
+
+        if len(periods) < 2:
+            return {'analysis_period': None, 'compare_period': None, 'label': '月度样本不足'}
+
+        latest_month = periods[-1]
+        _, latest_month_end = get_month_range(latest_month)
+        latest_complete = bool(latest_week_end_date and latest_week_end_date >= latest_month_end)
+        if latest_complete or len(periods) < 3:
+            curr, prev = periods[-1], periods[-2]
+            return {
+                'analysis_period': curr,
+                'compare_period': prev,
+                'skipped_period': None,
+                'label': f'{curr} 对比 {prev}',
+            }
+
+        curr, prev = periods[-2], periods[-3]
+        return {
+            'analysis_period': curr,
+            'compare_period': prev,
+            'skipped_period': latest_month,
+            'skipped_reason': 'latest_month_incomplete',
+            'label': f'{curr} 对比 {prev}（{latest_month} 未完结，暂不参与）',
+        }
+
+    def build_total_output_reason(module_options, view, dept, curr_period, prev_period, output_field, unit):
+        curr_rows = get_rows_for_period(module_options, view, curr_period, dept)
+        prev_rows = get_rows_for_period(module_options, view, prev_period, dept)
+        curr_total = sum_output(curr_rows, output_field)
+        prev_total = sum_output(prev_rows, output_field)
+        total_diff = curr_total - prev_total
+        total_pct = safe_pct(curr_total, prev_total)
+        if total_pct is None or abs(total_pct) < 5:
+            return ''
+
+        curr_map = build_project_output_map(curr_rows, output_field)
+        prev_map = build_project_output_map(prev_rows, output_field)
+        items = []
+        for key in set(curr_map.keys()) | set(prev_map.keys()):
+            curr = curr_map.get(key, {'output': 0, 'label': prev_map.get(key, {}).get('label', '未知项目')})
+            prev = prev_map.get(key, {'output': 0, 'label': curr.get('label', '未知项目')})
+            diff = curr['output'] - prev['output']
+            if total_diff > 0 and diff <= 0:
+                continue
+            if total_diff < 0 and diff >= 0:
+                continue
+            items.append({
+                'label': curr.get('label') or prev.get('label') or '未知项目',
+                'diff': diff,
+                'share': abs(diff) / abs(total_diff) if total_diff else 0,
+            })
+
+        items.sort(key=lambda x: abs(x['diff']), reverse=True)
+        if not items:
+            return ''
+
+        def item_text(item):
+            return (
+                anomaly_project_html(item['label']) +
+                direction_word(item['diff']) +
+                anomaly_delta_html(item['diff'], format_qty(item['diff'], unit))
+            )
+
+        first = items[0]
+        second = items[1] if len(items) > 1 else None
+        third = items[2] if len(items) > 2 else None
+        if first['share'] >= 0.35:
+            project_text = item_text(first) + '。'
+        elif first['share'] >= 0.15:
+            if second and second['share'] >= 0.10:
+                project_text = item_text(first) + '、' + item_text(second) + '。'
+            else:
+                extras = [item for item in [second, third] if item]
+                if extras:
+                    project_text = item_text(first) + '，此外' + '、'.join(item_text(item) for item in extras) + '小量波动引起。'
+                else:
+                    project_text = item_text(first) + '。'
+        else:
+            small_items = items[:3] if len(items) >= 3 else items[:2]
+            project_text = '、'.join(item_text(item) for item in small_items) + '小量波动引起。'
+
+        return {
+            'headline': anomaly_metric_headline(view, total_pct),
+            'detail': project_text,
+        }
+
+    def build_avg_daily_output_reason(metrics_by_period, curr_period, prev_period):
+        curr = metrics_by_period.get(curr_period, {})
+        prev = metrics_by_period.get(prev_period, {})
+        output_pct = safe_pct(curr.get('total_output', 0), prev.get('total_output', 0))
+        avg_pct = safe_pct(curr.get('avg_daily_output', 0), prev.get('avg_daily_output', 0))
+        if output_pct is None or avg_pct is None:
+            return {'headline': '', 'detail': ''}
+
+        same_direction = (output_pct >= 0 and avg_pct >= 0) or (output_pct < 0 and avg_pct < 0)
+        if same_direction and abs(avg_pct - output_pct) < 10:
+            return ''
+
+        manpower_diff = (curr.get('output_manpower', 0) or 0) - (prev.get('output_manpower', 0) or 0)
+        workday_diff = (curr.get('workdays', 0) or 0) - (prev.get('workdays', 0) or 0)
+        reasons = []
+        if abs(manpower_diff) >= 0.1:
+            if manpower_diff > 0:
+                reasons.append('产出用人力增加' + anomaly_delta_html(manpower_diff, format_people(manpower_diff)))
+            else:
+                reasons.append('产出用人力减少' + anomaly_delta_html(manpower_diff, format_people(manpower_diff)))
+        if abs(workday_diff) >= 1:
+            if workday_diff > 0:
+                reasons.append('工作日增加' + anomaly_delta_html(workday_diff, f'{abs(workday_diff):.0f}天'))
+            else:
+                reasons.append('工作日减少' + anomaly_delta_html(workday_diff, f'{abs(workday_diff):.0f}天'))
+        if not reasons:
+            return ''
+
+        if not same_direction:
+            trend_text = '总产出上涨，但人均日均产出下降' if output_pct > 0 else '总产出下降，但人均日均产出上升'
+            return trend_text + '，主要因' + '、'.join(reasons) + '。'
+        diff_word = '高于' if abs(avg_pct) > abs(output_pct) else '低于'
+        return f'人均日均产出变动幅度{diff_word}总产出，主要因' + '、'.join(reasons) + '。'
+
+    def build_single_time_reason(module_options, view, dept, curr_period, prev_period):
+        output_field = module_options['efficiency_output_field']
+        curr_rows = get_rows_for_period(module_options, view, curr_period, dept)
+        prev_rows = get_rows_for_period(module_options, view, prev_period, dept)
+        if module_options['exclude_intern_efficiency']:
+            curr_rows = exclude_intern_rows(curr_rows)
+            prev_rows = exclude_intern_rows(prev_rows)
+
+        curr_output = sum_output(curr_rows, output_field)
+        prev_output = sum_output(prev_rows, output_field)
+        curr_minutes = sum((row.get('周报工作量', 0) or 0) * 60 for row in curr_rows)
+        prev_minutes = sum((row.get('周报工作量', 0) or 0) * 60 for row in prev_rows)
+        curr_avg = curr_minutes / curr_output if curr_output > 0 else 0
+        prev_avg = prev_minutes / prev_output if prev_output > 0 else 0
+        pct = safe_pct(curr_avg, prev_avg)
+        if pct is None or abs(pct) <= 10:
+            return ''
+
+        def build_simple_type_summary(rows):
+            total_output = 0
+            simple_output = 0
+            simple_type_map = {}
+            simple_project_type_map = {}
+            for row in rows:
+                output_value = row.get(output_field, 0) or 0
+                total_output += output_value
+                demand_type = str(row.get('需求类型') or '').strip()
+                if not is_simple_demand_type(module_options['name'], demand_type):
+                    continue
+                simple_output += output_value
+                if demand_type not in simple_type_map:
+                    simple_type_map[demand_type] = {'label': demand_type, 'output': 0}
+                simple_type_map[demand_type]['output'] += output_value
+                key = get_project_key(row)
+                project_type_key = (key, demand_type)
+                if project_type_key not in simple_project_type_map:
+                    simple_project_type_map[project_type_key] = {
+                        'label': get_project_label(row),
+                        'demand_type': demand_type,
+                        'output': 0,
+                    }
+                simple_project_type_map[project_type_key]['output'] += output_value
+            share = simple_output / total_output if total_output > 0 else 0
+            return {
+                'total_output': total_output,
+                'simple_output': simple_output,
+                'share': share,
+                'type_map': simple_type_map,
+                'project_type_map': simple_project_type_map,
+            }
+
+        def build_simple_type_reason():
+            curr_summary = build_simple_type_summary(curr_rows)
+            prev_summary = build_simple_type_summary(prev_rows)
+            if curr_summary['total_output'] <= 0 or prev_summary['total_output'] <= 0:
+                return None
+            share_diff = curr_summary['share'] - prev_summary['share']
+            if (pct > 0 and share_diff >= 0) or (pct < 0 and share_diff <= 0):
+                return None
+
+            curr_type_map = curr_summary['type_map']
+            prev_type_map = prev_summary['type_map']
+            type_items = []
+            for key in set(curr_type_map.keys()) | set(prev_type_map.keys()):
+                curr_item = curr_type_map.get(key, {'label': prev_type_map.get(key, {}).get('label', '未知类别'), 'output': 0})
+                prev_item = prev_type_map.get(key, {'label': curr_item.get('label', '未知类别'), 'output': 0})
+                diff = curr_item['output'] - prev_item['output']
+                if pct > 0 and diff >= 0:
+                    continue
+                if pct < 0 and diff <= 0:
+                    continue
+                type_items.append({
+                    'label': curr_item.get('label') or prev_item.get('label') or '未知类别',
+                    'diff': diff,
+                })
+            if not type_items:
+                return None
+
+            curr_map = curr_summary['project_type_map']
+            prev_map = prev_summary['project_type_map']
+            target_items = []
+            for key in set(curr_map.keys()) | set(prev_map.keys()):
+                curr_item = curr_map.get(key, {'label': prev_map.get(key, {}).get('label', '未知项目'), 'output': 0})
+                prev_item = prev_map.get(key, {'label': curr_item.get('label', '未知项目'), 'output': 0})
+                diff = curr_item['output'] - prev_item['output']
+                if pct > 0 and diff >= 0:
+                    continue
+                if pct < 0 and diff <= 0:
+                    continue
+                target_items.append({
+                    'label': curr_item.get('label') or prev_item.get('label') or '未知项目',
+                    'demand_type': curr_item.get('demand_type') or prev_item.get('demand_type') or '简单需求',
+                    'diff': diff,
+                })
+            if not target_items:
+                return None
+
+            type_items.sort(key=lambda item: abs(item['diff']), reverse=True)
+            target_items.sort(key=lambda item: abs(item['diff']), reverse=True)
+            top_item = target_items[0]
+            share_point_diff = share_diff * 100
+            share_word = '下降' if share_diff < 0 else '提升'
+            type_word = '下降' if share_diff < 0 else '上升'
+            type_text = '、'.join(item['label'] for item in type_items[:2])
+            project_word = '减少' if top_item['diff'] < 0 else '增加'
+            return {
+                'headline': anomaly_metric_headline(view, pct, '上升', '下降'),
+                'detail': (
+                    f"主要因简单的需求占比{share_word}"
+                    f"{abs(share_point_diff):.1f}个百分点"
+                    f"（{type_text}类别{type_word}）<br>"
+                    f"如{top_item['demand_type']}类别的{anomaly_project_html(top_item['label'])}{project_word}"
+                    f"{anomaly_delta_html(top_item['diff'], format_qty(top_item['diff'], unit))}。"
+                ),
+            }
+
+        curr_map = build_project_efficiency_map(curr_rows, output_field)
+        prev_map = build_project_efficiency_map(prev_rows, output_field)
+        direction = 1 if pct > 0 else -1
+        unit = get_output_unit(module_options['name'])
+
+        simple_type_reason = build_simple_type_reason()
+        if simple_type_reason:
+            return simple_type_reason
+
+        reason_groups = {}
+
+        def get_relevant_time_and_avg(curr, prev):
+            if curr['output'] > 0:
+                return curr['single_time'], curr_avg
+            return prev['single_time'], prev_avg
+
+        def get_time_level(single_time, avg_time):
+            if avg_time <= 0:
+                return 'regular'
+            if single_time >= avg_time * 1.5:
+                return 'high'
+            if single_time <= avg_time * 0.5:
+                return 'low'
+            return 'regular'
+
+        def get_regular_relation(single_time, avg_time):
+            return '高于平均水平' if single_time >= avg_time else '低于平均水平'
+
+        def add_reason(group_key, group_label, item):
+            if group_key not in reason_groups:
+                reason_groups[group_key] = {'label': group_label, 'items': [], 'impact': 0}
+            reason_groups[group_key]['items'].append(item)
+            reason_groups[group_key]['impact'] += abs(item['impact'])
+
+        for key in set(curr_map.keys()) | set(prev_map.keys()):
+            curr = curr_map.get(key, {'label': prev_map.get(key, {}).get('label', '未知项目'), 'output': 0, 'workload_minutes': 0, 'single_time': 0})
+            prev = prev_map.get(key, {'label': curr.get('label', '未知项目'), 'output': 0, 'workload_minutes': 0, 'single_time': 0})
+            impact = curr['workload_minutes'] - prev['workload_minutes'] - prev_avg * (curr['output'] - prev['output'])
+            if direction > 0 and impact <= 0:
+                continue
+            if direction < 0 and impact >= 0:
+                continue
+
+            output_delta = curr['output'] - prev['output']
+            relevant_time, relevant_avg = get_relevant_time_and_avg(curr, prev)
+            level = get_time_level(relevant_time, relevant_avg)
+            relation = get_regular_relation(relevant_time, relevant_avg)
+            item = {
+                'label': curr.get('label') or prev.get('label') or '未知项目',
+                'curr_output': curr['output'],
+                'prev_output': prev['output'],
+                'curr_single_time': curr['single_time'],
+                'prev_single_time': prev['single_time'],
+                'relevant_relation': relation,
+                'output_delta': output_delta,
+                'time_delta': curr['single_time'] - prev['single_time'],
+                'impact': impact,
+            }
+
+            if direction > 0:
+                if output_delta > 0 and level == 'high':
+                    add_reason('high_increase', '高耗时项目产出增加', item)
+                elif level == 'regular' and relevant_time >= relevant_avg:
+                    add_reason('regular_high', '受到高于平均水平的常规项目影响', item)
+                elif output_delta < 0 and level == 'low':
+                    add_reason('low_decrease', '低耗时项目需求减少', item)
+                elif level == 'regular' and relevant_time < relevant_avg:
+                    add_reason('regular_low', '受到低于平均水平的常规项目影响', item)
+            else:
+                if output_delta > 0 and level == 'low':
+                    add_reason('low_increase', '低耗时项目产出增加', item)
+                elif level == 'regular' and relevant_time <= relevant_avg:
+                    add_reason('regular_low', '受到低于平均水平的常规项目影响', item)
+                elif output_delta < 0 and level == 'high':
+                    add_reason('high_decrease', '高耗时项目需求减少', item)
+                elif level == 'regular' and relevant_time > relevant_avg:
+                    add_reason('regular_high', '受到高于平均水平的常规项目影响', item)
+
+        groups = sorted(reason_groups.values(), key=lambda x: x['impact'], reverse=True)
+        if not groups:
+            return {'headline': '', 'detail': ''}
+        selected_groups = groups[:1]
+
+        def get_complex_note(item):
+            output_delta = item['output_delta']
+            time_delta = item['time_delta']
+            if abs(time_delta) < 0.05 or output_delta == 0:
+                return ''
+            if direction > 0:
+                if output_delta < 0 and time_delta > 0:
+                    return '，虽产出减少，但单片耗时上升，总体推高部门平均耗时'
+                if output_delta > 0 and time_delta < 0:
+                    return '，虽单片耗时下降，但产出增加，总体推高部门平均耗时'
+            else:
+                if output_delta > 0 and time_delta > 0:
+                    return '，虽单片耗时上升，但产出增加，总体拉低部门平均耗时'
+                if output_delta < 0 and time_delta < 0:
+                    return '，虽产出减少，但单片耗时下降，总体拉低部门平均耗时'
+            return ''
+
+        def project_text(item, show_complex_note=False):
+            project = anomaly_project_html(item['label'])
+            if item['curr_output'] == 0 and item['prev_output'] > 0:
+                time_text = f"本期产出为0（上期为{item['prev_single_time']:.1f}分钟/{unit}）"
+                output_text = f"产出量{format_qty(item['prev_output'], unit)} -> {format_qty(item['curr_output'], unit)}"
+                return f"{project}{time_text}，{output_text}"
+            if item['prev_output'] <= 0:
+                time_text = f"{item['curr_single_time']:.1f}分钟/{unit}"
+                note = get_complex_note(item) if show_complex_note else ''
+                return f"{project}{time_text}，新项目产出{format_qty(item['curr_output'], unit)}{note}"
+            if abs(item['curr_single_time'] - item['prev_single_time']) < 0.05:
+                time_text = f"{item['curr_single_time']:.1f}分钟/{unit}"
+            else:
+                time_text = f"{item['prev_single_time']:.1f} -> {item['curr_single_time']:.1f}分钟/{unit}"
+            output_text = f"产出量{format_qty(item['prev_output'], unit)} -> {format_qty(item['curr_output'], unit)}"
+            note = get_complex_note(item) if show_complex_note else ''
+            return f"{project}{time_text}，{output_text}{note}"
+
+        def group_text(group):
+            group['items'].sort(key=lambda x: abs(x['impact']), reverse=True)
+            items = group['items'][:1]
+            show_complex_note = '常规项目' in group['label']
+            return (
+                f"主要因{group['label']}<br>" +
+                '；'.join(project_text(item, show_complex_note) for item in items) +
+                '。'
+            )
+
+        return {
+            'headline': anomaly_metric_headline(view, pct, '上升', '下降'),
+            'detail': ''.join(group_text(group) for group in selected_groups),
+        }
+
+    def empty_anomaly_item():
+        return {'headline': '', 'detail': '', 'text': ''}
+
+    def normalize_anomaly_item(value):
+        if isinstance(value, dict):
+            headline = value.get('headline', '')
+            detail = value.get('detail', '')
+            text = value.get('text') or ((headline + '<br>' + detail) if headline and detail else headline or detail)
+            return {'headline': headline, 'detail': detail, 'text': text}
+        text = value or ''
+        return {'headline': '', 'detail': text, 'text': text}
+
+    def build_labor_cost_reason(module_options, dept_metrics, view, dept, curr_period, prev_period, output_field, unit):
+        curr = dept_metrics.get(curr_period, {})
+        prev = dept_metrics.get(prev_period, {})
+        curr_cost = curr.get('single_labor_cost', 0) or 0
+        prev_cost = prev.get('single_labor_cost', 0) or 0
+        pct = safe_pct(curr_cost, prev_cost)
+        if pct is None or abs(pct) < 10:
+            return empty_anomaly_item()
+
+        curr_num = curr.get('labor_cost_numerator', 0) or 0
+        prev_num = prev.get('labor_cost_numerator', 0) or 0
+        curr_output = curr.get('total_output', 0) or 0
+        prev_output = prev.get('total_output', 0) or 0
+        curr_labor_row = LABOR_COST_INDEX.get((curr_period, dept), {})
+        prev_labor_row = LABOR_COST_INDEX.get((prev_period, dept), {})
+        curr_labor_amount = curr_labor_row.get('人力+工位', 0) or 0
+        prev_labor_amount = prev_labor_row.get('人力+工位', 0) or 0
+        curr_total_manpower = curr_labor_row.get('总人力', 0) or 0
+        prev_total_manpower = prev_labor_row.get('总人力', 0) or 0
+        num_pct = safe_pct(curr_num, prev_num) or 0
+        denom_pct = safe_pct(curr_output, prev_output) or 0
+        labor_amount_pct = safe_pct(curr_labor_amount, prev_labor_amount)
+        output_diff = curr_output - prev_output
+        labor_amount_diff = curr_labor_amount - prev_labor_amount
+
+        parts = []
+        output_is_driver = abs(denom_pct) >= 8 and abs(denom_pct) >= abs(num_pct) * 0.75
+        numerator_is_driver = abs(num_pct) >= 8 and abs(num_pct) >= abs(denom_pct) * 0.75
+
+        if output_is_driver:
+            project_reason = build_total_output_reason(module_options, view, dept, curr_period, prev_period, output_field, unit)
+            project_reason = normalize_anomaly_item(project_reason).get('detail', '')
+            project_reason = project_reason.rstrip('。')
+            if project_reason:
+                parts.append(
+                    f'总产出{direction_word(output_diff)}' +
+                    anomaly_delta_html(output_diff, format_qty(output_diff, unit)) +
+                    f'，其中{project_reason}影响最大'
+                )
+            else:
+                parts.append(
+                    f'总产出{direction_word(output_diff)}' +
+                    anomaly_delta_html(output_diff, format_qty(output_diff, unit))
+                )
+
+        labor_cost_can_describe = labor_amount_pct is not None and abs(labor_amount_pct) > 5
+        if numerator_is_driver and labor_cost_can_describe:
+            detail = []
+            manpower_diff = curr_total_manpower - prev_total_manpower
+            cost_pct = safe_pct(curr.get('labor_cost_per_capita', 0), prev.get('labor_cost_per_capita', 0))
+            if abs(manpower_diff) >= 0.1:
+                detail.append(
+                    f"总人力{direction_word(manpower_diff)}" +
+                    anomaly_delta_html(manpower_diff, format_people(manpower_diff))
+                )
+            if cost_pct is not None and abs(cost_pct) >= 1:
+                detail.append(
+                    f"人均人力成本{direction_word(cost_pct)}" +
+                    anomaly_delta_html(cost_pct, f'{abs(cost_pct):.1f}%')
+                )
+            detail_text = '，其中' + '、'.join(detail) if detail else ''
+            parts.append(
+                f'人力成本{direction_word(labor_amount_diff)}' +
+                anomaly_delta_html(labor_amount_diff, format_money(labor_amount_diff)) +
+                detail_text
+            )
+
+        if not parts:
+            return empty_anomaly_item()
+        return {
+            'headline': anomaly_metric_headline(view, pct, '上升', '下降'),
+            'detail': '主要因' + '；'.join(parts) + '。',
+        }
+
+    def build_anomaly_reason_data(module_options, module_name, sorted_depts, module_data, labor_cost_module_data=None):
+        result = {}
+        unit = get_output_unit(module_name)
+        for view in ['monthly', 'weekly']:
+            periods = RECENT_MONTHS if view == 'monthly' else RECENT_WEEKS
+            meta = build_period_meta(view, periods)
+            curr_period = meta.get('analysis_period')
+            prev_period = meta.get('compare_period')
+            view_result = {'meta': meta, 'total_output': {}, 'avg_daily_output': {}, 'single_time': {}, 'single_labor_cost': {}}
+            if not curr_period or not prev_period:
+                result[view] = view_result
+                continue
+
+            for dept in sorted_depts:
+                dept_metrics = module_data[view]['dept_metrics'][dept]
+                view_result['total_output'][dept] = normalize_anomaly_item(
+                    build_total_output_reason(
+                        module_options, view, dept, curr_period, prev_period, module_options['output_field'], unit
+                    )
+                )
+                view_result['avg_daily_output'][dept] = {
+                    'text': build_avg_daily_output_reason(dept_metrics, curr_period, prev_period)
+                }
+                view_result['single_time'][dept] = normalize_anomaly_item(
+                    build_single_time_reason(module_options, view, dept, curr_period, prev_period)
+                )
+
+                if view == 'monthly' and labor_cost_module_data:
+                    cost_dept_metrics = labor_cost_module_data['dept_metrics'].get(dept, {})
+                    if curr_period in cost_dept_metrics and prev_period in cost_dept_metrics:
+                        view_result['single_labor_cost'][dept] = normalize_anomaly_item(
+                            build_labor_cost_reason(
+                                module_options, cost_dept_metrics, view, dept, curr_period, prev_period,
+                                module_options['output_field'], unit
+                            )
+                        )
+            result[view] = view_result
+        if labor_cost_module_data and 'monthly' in result:
+            monthly_cost = result['monthly'].get('single_labor_cost', {})
+            monthly_meta = result['monthly'].get('meta', {})
+            result.setdefault('weekly', {}).setdefault('single_labor_cost', {})
+            result['weekly']['single_labor_cost'] = monthly_cost
+            result['weekly']['labor_cost_meta'] = monthly_meta
+        return result
+
+    # ============================================================
     # 计算所有指标数据
     # ============================================================
     print('计算指标数据...')
@@ -1237,6 +2505,31 @@ def main():
     print('  数据计算完成')
 
     # ============================================================
+    # 异常简析数据计算
+    # ============================================================
+    print('计算异常简析数据...')
+    anomaly_reason_data = {'monthly': {}, 'weekly': {}}
+    for mod in MODULES:
+        if should_hide_module(mod):
+            continue
+        module_options = build_module_runtime_options(mod)
+        mname = module_options['name']
+        sorted_depts = get_sorted_departments(module_options)
+        module_reason_data = build_anomaly_reason_data(
+            module_options,
+            mname,
+            sorted_depts,
+            {
+                'monthly': dashboard_data['monthly'][mname],
+                'weekly': dashboard_data['weekly'][mname],
+            },
+            labor_cost_data.get(mname)
+        )
+        anomaly_reason_data['monthly'][mname] = module_reason_data.get('monthly', {})
+        anomaly_reason_data['weekly'][mname] = module_reason_data.get('weekly', {})
+    print('  异常简析数据计算完成')
+
+    # ============================================================
     # 结构分析数据计算
     # ============================================================
     print('计算结构分析数据...')
@@ -1273,14 +2566,24 @@ def main():
     print('  结构分析数据计算完成')
 
     # ============================================================
+    # 人员效率分析数据
+    # ============================================================
+    print('计算人员效率分析数据...')
+    person_efficiency_data = build_person_efficiency_data()
+    print(f"  人员效率行: {len(person_efficiency_data['rows'])} 条")
+    print(f"  人员明细行: {len(person_efficiency_data['details'])} 条")
+
+    # ============================================================
     # 生成 HTML
     # ============================================================
     print('生成 HTML...')
 
     js_data = json.dumps(dashboard_data, ensure_ascii=False)
     labor_cost_js_data = json.dumps(labor_cost_data, ensure_ascii=False)
+    anomaly_reason_js_data = json.dumps(anomaly_reason_data, ensure_ascii=False)
     structure_js_data = json.dumps(structure_data, ensure_ascii=False)
     efficiency_analysis_js_data = json.dumps(efficiency_analysis_data, ensure_ascii=False)
+    person_efficiency_js_data = json.dumps(person_efficiency_data, ensure_ascii=False)
     month_labels = json.dumps(RECENT_MONTHS)
     labor_cost_month_labels = json.dumps(LABOR_COST_MONTHS)
     week_labels = json.dumps(RECENT_WEEKS)
@@ -1313,8 +2616,10 @@ def main():
     html = (html_template
         .replace('{{DATA_JSON}}', js_data)
         .replace('{{LABOR_COST_DATA_JSON}}', labor_cost_js_data)
+        .replace('{{ANOMALY_REASON_DATA_JSON}}', anomaly_reason_js_data)
         .replace('{{STRUCTURE_DATA_JSON}}', structure_js_data)
         .replace('{{EFFICIENCY_ANALYSIS_DATA_JSON}}', efficiency_analysis_js_data)
+        .replace('{{PERSON_EFFICIENCY_DATA_JSON}}', person_efficiency_js_data)
         .replace('{{MONTH_LABELS_JSON}}', month_labels)
         .replace('{{LABOR_COST_MONTH_LABELS_JSON}}', labor_cost_month_labels)
         .replace('{{WEEK_LABELS_JSON}}', week_labels)

@@ -49,7 +49,20 @@ function createElementStub(id) {
     appendChild(child) {
       this.children = this.children || [];
       this.children.push(child);
+      if (child && child.innerHTML) {
+        this.innerHTML += child.innerHTML;
+      }
       return child;
+    },
+    insertAdjacentHTML(position, html) {
+      const value = String(html);
+      this.children = this.children || [];
+      this.children.push(createElementStub('inserted-html'));
+      if (position === 'afterbegin') {
+        this.innerHTML = value + this.innerHTML;
+      } else {
+        this.innerHTML += value;
+      }
     },
     querySelector() {
       return null;
@@ -157,6 +170,13 @@ assert(
 
 const moduleNames = run('MODULE_NAMES.slice()');
 assert(moduleNames.length > 0, 'No modules found in DASHBOARD_PAYLOAD');
+assert(run('typeof ANOMALY_REASON_DATA === "object"'), 'Anomaly reason payload is not available');
+assert(run('appState.anomalyBriefVisible') === true, 'Anomaly brief should be visible by default');
+
+run('toggleAnomalyBrief()');
+assert(run('appState.anomalyBriefVisible') === false, 'Anomaly brief toggle did not hide reasons');
+run('toggleAnomalyBrief()');
+assert(run('appState.anomalyBriefVisible') === true, 'Anomaly brief toggle did not show reasons again');
 
 for (const moduleName of moduleNames) {
   run('openModuleView(' + quote(moduleName) + ')');
@@ -167,6 +187,10 @@ for (const moduleName of moduleNames) {
     assert(
       getChildrenCount(chartContainerId) >= 2,
       moduleName + ' ' + view + ' render output is unexpectedly small: ' + getChildrenCount(chartContainerId)
+    );
+    assert(
+      getInnerHtmlLength(chartContainerId) > 0,
+      moduleName + ' ' + view + ' anomaly/chart markup did not render'
     );
 
     run('openStructureAnalysis(' + quote(moduleName) + ', "全部")');
